@@ -1,0 +1,310 @@
+/* Credit History Reseller Stylesheet */
+
+.credit-history-page {
+  padding: 24px;
+  background-color: #f8fafc;
+  font-family: 'Segoe UI', Roboto, sans-serif;
+}
+
+.credit-history-card {
+  background: #ffffff;
+  border-radius: 8px;
+  border: 1px solid #e6e8ef;
+  box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.02);
+  padding: 24px;
+  margin-bottom: 24px;
+}
+
+/* Header section */
+.history-header-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 24px;
+  border-bottom: 1px solid #f1f5f9;
+  padding-bottom: 16px;
+  flex-wrap: wrap;
+  gap: 16px;
+}
+
+.history-header-left {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.history-avatar-icon {
+  background-color: #e0f2fe;
+  color: #0284c7;
+  width: 38px;
+  height: 38px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.history-header-title {
+  font-size: 20px;
+  font-weight: 700;
+  color: #1e293b;
+  margin: 0;
+}
+
+/* Row of filters matching Screenshot 1 */
+.history-header-filters {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.history-filter-select {
+  border: 1px solid #cbd5e1;
+  padding: 8px 14px;
+  border-radius: 6px;
+  font-size: 13px;
+  background-color: #ffffff;
+  color: #334155;
+  outline: none;
+  min-width: 140px;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.02);
+  transition: border-color 0.15s ease;
+}
+
+.history-filter-select:focus {
+  border-color: #3b82f6;
+}
+
+.history-date-badge {
+  background-color: #1abc9c;
+  color: #ffffff;
+  font-size: 13px;
+  font-weight: 600;
+  padding: 8px 16px;
+  border-radius: 6px;
+  user-select: none;
+  box-shadow: 0 2px 4px rgba(26, 188, 156, 0.15);
+}
+
+/* Sub filter bar containing entries count and right-side search input */
+.history-sub-filters {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 16px;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
+.history-entries-select {
+  font-size: 13px;
+  color: #64748b;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.history-entries-select select {
+  border: 1px solid #cbd5e1;
+  padding: 6px 10px;
+  border-radius: 6px;
+  outline: none;
+  font-size: 13px;
+  background-color: #ffffff;
+  color: #334155;
+}
+
+.history-search-wrapper {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13.5px;
+  color: #64748b;
+}
+
+.history-search-input {
+  border: 1px solid #cbd5e1;
+  padding: 6px 12px;
+  border-radius: 6px;
+  font-size: 13px;
+  outline: none;
+  width: 180px;
+  color: #334155;
+}
+
+.history-search-input:focus {
+  border-color: #3b82f6;
+}
+
+/* Table layout styling */
+.history-table-container {
+  overflow-x: auto;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  margin-bottom: 16px;
+}
+
+.history-data-table {
+  width: 100%;
+  border-collapse: collapse;
+  text-align: left;
+  font-size: 13px;
+}
+
+.history-data-table th {
+  background-color: #1abc9c;
+  color: #ffffff;
+  font-weight: 600;
+  padding: 12px 16px;
+  border-bottom: 1px solid #16a085;
+  border-right: 1px solid rgba(255,255,255,0.25);
+  white-space: nowrap;
+}
+
+.history-data-table th:last-child {
+  border-right: none;
+}
+
+.history-data-table td {
+  padding: 12px 16px;
+  border-bottom: 1px solid #e2e8f0;
+  border-right: 1px solid #e8eaf0;
+  color: #334155;
+  vertical-align: middle;
+}
+
+.history-data-table td:last-child {
+  border-right: none;
+}
+
+.history-data-table tbody tr:hover {
+  background-color: #f8fafc;
+}
+
+.history-empty-row {
+  text-align: center;
+  color: #64748b;
+  font-style: italic;
+  padding: 32px !important;
+}
+
+/* Expander details button */
+.history-expander-btn {
+  background: none;
+  border: none;
+  color: #27ae60;
+  cursor: pointer;
+  font-weight: 700;
+  font-size: 14px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  border: 1px solid #27ae60;
+  transition: all 0.15s ease;
+}
+
+.history-expander-btn:hover {
+  background-color: #e8f5e9;
+}
+
+/* Badges for CREDIT / DEBIT types */
+.type-badge-credit,
+.type-badge-debit {
+  font-size: 11px;
+  font-weight: 700;
+  padding: 4px 10px;
+  border-radius: 4px;
+  text-align: center;
+  display: inline-block;
+  text-transform: uppercase;
+}
+
+.type-badge-credit {
+  background-color: #e0f2fe;
+  color: #0369a1;
+  border: 1px solid #bae6fd;
+}
+
+.type-badge-debit {
+  background-color: #fee2e2;
+  color: #b91c1c;
+  border: 1px solid #fecaca;
+}
+
+/* Expanded details cards */
+.history-detail-row-expanded {
+  background-color: #f8fafc;
+}
+
+.history-detail-expanded-card {
+  padding: 16px;
+  border: 1px dashed #cbd5e1;
+  border-radius: 6px;
+  margin: 4px 16px;
+  font-size: 13px;
+  color: #475569;
+}
+
+.history-detail-expanded-item {
+  margin-bottom: 6px;
+}
+
+.history-detail-expanded-item strong {
+  color: #1e293b;
+}
+
+/* Footer Pagination */
+.history-table-footer {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
+.history-showing-entries {
+  font-size: 13px;
+  color: #3b82f6;
+  border: 1px solid #dbeafe;
+  background-color: #eff6ff;
+  padding: 6px 12px;
+  border-radius: 6px;
+}
+
+.history-pagination {
+  display: flex;
+  gap: 4px;
+}
+
+.btn-history-pag {
+  border: 1px solid #cbd5e1;
+  background-color: #ffffff;
+  color: #475569;
+  padding: 6px 12px;
+  font-size: 12.5px;
+  font-weight: 600;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.btn-history-pag:hover:not(:disabled) {
+  background-color: #f1f5f9;
+  border-color: #94a3b8;
+}
+
+.btn-history-pag.active {
+  background-color: #3b82f6;
+  color: #ffffff;
+  border-color: #3b82f6;
+}
+
+.btn-history-pag:disabled {
+  background-color: #f8fafc;
+  color: #cbd5e1;
+  cursor: not-allowed;
+}

@@ -1,0 +1,367 @@
+import { pool } from '../config/db.js';
+import logger from '../utils/logger.js';
+import { emitToOrganization, emitSocketEvent } from '../utils/socket.js';
+import { normalizePhone, get10DigitSuffix } from '../utils/phoneUtils.js';
+
+/**
+ * Automatically creates/updates a contact, conversation, and records a message (sent or received).
+ * Strict Multi-Tenant Scoping: 1 Phone Number = 1 Conversation per organization & WhatsApp account.
+ */
+export async function recordChatMessage({
+  traceId = null,
+  userId = 1,
+  organizationId = null,
+  whatsappAccountId = null,
+  phone,
+  messageText,
+  wamid = null,
+  sender = 'user',
+  direction = null,
+  messageType = 'text',
+  status = 'sent',
+  sessionId = 'default',
+  instanceId = null,
+  contactName: inputContactName = null,
+  mediaId = null,
+  mediaUrl = null,
+  rawPayload = null,
+  campaignId = null,
+}) {
+  try {
+    if (!phone || (!messageText && !mediaId)) return null;
+
+    const sanitisedPhone = normalizePhone(phone);
+    if (!sanitisedPhone) return null;
+
+    // Deduplicate by wamid if already recorded
+    if (wamid) {
+      try {
+        const [existing] = await pool.query('SELECT id, conversation_id, status FROM messages WHERE wa_message_id = ? LIMIT 1', [wamid]);
+        if (existing.length > 0) {
+          return {
+            message: {
+              id: existing[0].id,
+              conversation_id: existing[0].conversation_id,
+              text: messageText,
+              wamid,
+              status: existing[0].status || status
+            }
+          };
+        }
+      } catch (_) {}
+    }
+
+    const suffix10 = get10DigitSuffix(sanitisedPhone);
+    const formattedPhoneFallback = `+${sanitisedPhone}`;
+    const msgDirection = direction || (sender === 'contact' ? 'incoming' : 'outgoing');
+    const isIncoming = msgDirection === 'incoming' || sender === 'contact';
+    const normalizedType = String(messageType || 'text').toLowerCase();
+    const previewPrefix = normalizedType === 'image' ? '📷 Image: ' : normalizedType === 'video' ? '🎥 Video: ' :
+      (normalizedType === 'document' || normalizedType === 'application') ? '📄 Document: ' : '';
+    const conversationPreview = `${previewPrefix}${messageText || (previewPrefix ? 'Attachment' : '[Media]')}`;
+
+    // 1. Blacklist check
+    try {
+      const { checkBlacklist } = await import('./blacklistService.js');
+      const isBlocked = await checkBlacklist(sanitisedPhone);
+      if (isBlocked) {
+        logger.warn(`[BLACKLIST] Blocked message processing for blacklisted number: ${sanitisedPhone}`);
+        if (!isIncoming) throw new Error('Recipient is blacklisted.');
+        return null;
+      }
+    } catch (blErr) {
+      if (blErr.message === 'Recipient is blacklisted.') throw blErr;
+    }
+
+    // 2. Resolve organization_id and whatsapp_account_id if not explicitly provided
+    let activeOrgId = organizationId;
+    let activeAccountId = whatsappAccountId;
+    let activeUserId = userId;
+
+    if (!activeOrgId || !activeAccountId) {
+      try {
+        if (instanceId && instanceId !== 'default') {
+          const [accRows] = await pool.query(
+            'SELECT id, organization_id, user_id FROM whatsapp_accounts WHERE phone_number_id = ? LIMIT 1',
+            [instanceId]
+          );
+          if (accRows.length > 0) {
+            activeAccountId = activeAccountId || accRows[0].id;
+            activeOrgId = activeOrgId || accRows[0].organization_id;
+            activeUserId = activeUserId || accRows[0].user_id;
+          }
+        }
+        if (!activeOrgId && userId) {
+          const [uRows] = await pool.query('SELECT organization_id FROM users WHERE id = ? LIMIT 1', [userId]);
+          if (uRows.length > 0 && uRows[0].organization_id) {
+            activeOrgId = uRows[0].organization_id;
+          }
+        }
+        if (!activeAccountId && activeOrgId) {
+          const [accRows] = await pool.query(
+            'SELECT id FROM whatsapp_accounts WHERE organization_id = ? ORDER BY id DESC LIMIT 1',
+            [activeOrgId]
+          );
+          if (accRows.length > 0) {
+            activeAccountId = accRows[0].id;
+          }
+        }
+      } catch (lookupErr) {
+        logger.warn(`[ChatService] Org/Account resolution warning: ${lookupErr.message}`);
+      }
+    }
+
+    // 3. IDEMPOTENCY CHECK: If wamid exists, check if already recorded
+    if (wamid) {
+      let checkQuery = 'SELECT id, conversation_id FROM messages WHERE wa_message_id = ?';
+      const checkParams = [wamid];
+      if (activeOrgId) {
+        checkQuery += ' AND organization_id = ?';
+        checkParams.push(activeOrgId);
+      }
+      const [existingMsgs] = await pool.query(checkQuery, checkParams);
+      if (existingMsgs.length > 0) {
+        logger.info(`[ChatService] Duplicate WAMID ${wamid} ignored. Message ID ${existingMsgs[0].id} already exists.`);
+        return { conversationId: existingMsgs[0].conversation_id, messageId: existingMsgs[0].id, isDuplicate: true };
+      }
+    }
+
+    // 4. FIND / CREATE CONTACT in contacts table
+    let contactId = null;
+    let contactProfileName = inputContactName;
+
+    if (activeOrgId) {
+      try {
+        // Fast indexed contact lookup first.
+        let [contacts] = await pool.query(
+          'SELECT id, name, profile_name FROM contacts WHERE organization_id = ? AND phone_number = ? LIMIT 1',
+          [activeOrgId, sanitisedPhone]
+        );
+
+        // Legacy formatted numbers: fallback only when exact match fails.
+        if (contacts.length === 0) {
+          [contacts] = await pool.query(
+            'SELECT id, name, profile_name FROM contacts WHERE organization_id = ? AND RIGHT(REGEXP_REPLACE(phone_number, "[^0-9]", ""), 10) = ? LIMIT 1',
+            [activeOrgId, suffix10]
+          );
+        }
+        if (contacts.length > 0) {
+          contactId = contacts[0].id;
+          if (inputContactName && inputContactName.trim()) {
+            contactProfileName = inputContactName.trim();
+            await pool.query('UPDATE contacts SET profile_name = ?, name = ? WHERE id = ?', [contactProfileName, contactProfileName, contactId]);
+          } else if (contacts[0].name && !contacts[0].name.startsWith('WhatsApp User') && !contacts[0].name.includes('Darshan') && !contacts[0].name.includes('Vipul')) {
+            contactProfileName = contacts[0].name;
+          } else {
+            contactProfileName = formattedPhoneFallback;
+          }
+        } else {
+          const defaultName = (inputContactName && inputContactName.trim())
+            ? inputContactName.trim()
+            : formattedPhoneFallback;
+          const [insContact] = await pool.query(
+            'INSERT INTO contacts (organization_id, phone_number, name, profile_name, wa_id) VALUES (?, ?, ?, ?, ?)',
+            [activeOrgId, sanitisedPhone, defaultName, inputContactName || null, sanitisedPhone]
+          );
+          contactId = insContact.insertId;
+          contactProfileName = defaultName;
+        }
+      } catch (cErr) {
+        logger.warn(`[ChatService] Contact handling warning: ${cErr.message}`);
+      }
+    }
+
+    console.log(`[4] CONTACT RESOLVED: contact_id=${contactId || 'New'}, name=${contactProfileName || sanitisedPhone}`);
+
+    // 5. SEARCH EXISTING CONVERSATION by phone number AND tenant isolation
+    // ✅ FIX: Now also scoped by whatsapp_account_id — same phone number talking to
+    // 2 different WhatsApp Business numbers will get 2 separate conversations.
+    let convQuery = `SELECT id, user_id, organization_id, whatsapp_account_id, contact_name, contact_phone, unread_count, has_replied 
+       FROM conversations 
+       WHERE (contact_phone = ? OR RIGHT(REGEXP_REPLACE(contact_phone, '[^0-9]', ''), 10) = ?)`;
+    const convParams = [sanitisedPhone, suffix10];
+
+    if (activeAccountId) {
+      convQuery += ` AND (whatsapp_account_id = ? OR whatsapp_account_id IS NULL)`;
+      convParams.push(activeAccountId);
+    }
+
+    if (activeOrgId) {
+      convQuery += ` AND organization_id = ?`;
+      convParams.push(activeOrgId);
+    } else if (activeUserId) {
+      convQuery += ` AND user_id = ?`;
+      convParams.push(activeUserId);
+    }
+    convQuery += ` ORDER BY (whatsapp_account_id = ${activeAccountId ? pool.escape(activeAccountId) : 'NULL'}) DESC, id ASC LIMIT 1`;
+
+    let [convs] = await pool.query(convQuery, convParams);
+
+    let conversationId = null;
+    let contactName = contactProfileName || (convs.length > 0 ? convs[0].contact_name : null);
+    let newUnreadCount = 0;
+    let hasReplied = isIncoming ? 1 : (convs.length > 0 ? (convs[0].has_replied || 0) : 0);
+
+    if (convs.length === 0) {
+      contactName = contactName && contactName.trim()
+        ? contactName.trim()
+        : formattedPhoneFallback;
+      newUnreadCount = isIncoming ? 1 : 0;
+
+      try {
+        const [insertConv] = await pool.query(
+          `INSERT INTO conversations (user_id, organization_id, whatsapp_account_id, contact_id, campaign_id, contact_name, contact_phone, last_message, last_message_at, last_message_time, unread_count, status, has_replied, instance_id) 
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW(), ?, 'open', ?, ?)`,
+          [activeUserId || 1, activeOrgId || null, activeAccountId || null, contactId || null, campaignId || null, contactName, sanitisedPhone, conversationPreview, newUnreadCount, isIncoming ? 1 : 0, instanceId || 'default']
+        );
+        conversationId = insertConv.insertId;
+        console.log(`[5] CONVERSATION FOUND/CREATED: conversation_id=${conversationId} (CREATED NEW, account_id=${activeAccountId})`);
+      } catch (insertErr) {
+        const [dupCheck] = await pool.query(
+          `SELECT id, user_id, organization_id, whatsapp_account_id, contact_name, unread_count, has_replied FROM conversations 
+           WHERE (contact_phone = ? OR RIGHT(REGEXP_REPLACE(contact_phone, '[^0-9]', ''), 10) = ?)
+           ${activeAccountId ? 'AND (whatsapp_account_id = ? OR whatsapp_account_id IS NULL)' : ''}
+           ORDER BY id ASC LIMIT 1`,
+          activeAccountId ? [sanitisedPhone, suffix10, activeAccountId] : [sanitisedPhone, suffix10]
+        );
+        if (dupCheck.length > 0) {
+          conversationId = dupCheck[0].id;
+          contactName = dupCheck[0].contact_name;
+          console.log(`[5] CONVERSATION FOUND/CREATED: conversation_id=${conversationId} (FOUND EXISTING after race)`);
+        } else {
+          throw insertErr;
+        }
+      }
+    } else {
+      conversationId = convs[0].id;
+      if (!contactName) contactName = convs[0].contact_name;
+      console.log(`[5] CONVERSATION FOUND/CREATED: conversation_id=${conversationId} (FOUND EXISTING, account_id=${convs[0].whatsapp_account_id})`);
+
+      if (inputContactName && inputContactName.trim()) {
+        contactName = inputContactName.trim();
+      }
+
+      if (isIncoming) {
+        newUnreadCount = (convs[0].unread_count || 0) + 1;
+        hasReplied = 1;
+        await pool.query(
+          `UPDATE conversations SET contact_phone = ?, contact_name = ?, last_message = ?, unread_count = ?, has_replied = 1, last_message_at = NOW(), last_message_time = NOW(),
+           organization_id = COALESCE(organization_id, ?), whatsapp_account_id = COALESCE(whatsapp_account_id, ?), contact_id = COALESCE(contact_id, ?)
+           WHERE id = ?`,
+          [sanitisedPhone, contactName, conversationPreview, newUnreadCount, activeOrgId || null, activeAccountId || null, contactId || null, conversationId]
+        );
+      } else {
+        await pool.query(
+          `UPDATE conversations SET contact_phone = ?, contact_name = ?, last_message = ?, last_message_at = NOW(), last_message_time = NOW() WHERE id = ?`,
+          [sanitisedPhone, contactName, conversationPreview, conversationId]
+        );
+      }
+    }
+
+    // 6. INSERT MESSAGE RECORD
+    const rawPayloadJson = rawPayload ? JSON.stringify(rawPayload) : null;
+    const dbMediaUrl = (mediaUrl && mediaUrl.length > 500) ? null : (mediaUrl || null);
+    
+    const [msgResult] = await pool.query(
+      `INSERT INTO messages (conversation_id, organization_id, whatsapp_account_id, contact_id, campaign_id, user_id, message_text, sender, direction, message_type, wa_message_id, sender_phone, recipient_phone, media_id, media_url, raw_payload, status, timestamp) 
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())`,
+      [
+        conversationId,
+        activeOrgId || null,
+        activeAccountId || null,
+        contactId || null,
+        campaignId || null,
+        activeUserId || 1,
+        messageText || '[Media message]',
+        sender,
+        msgDirection,
+        messageType || 'text',
+        wamid,
+        isIncoming ? sanitisedPhone : null,
+        isIncoming ? null : sanitisedPhone,
+        mediaId || null,
+        dbMediaUrl,
+        rawPayloadJson,
+        status || 'sent',
+      ]
+    );
+
+    const insertedMsgId = msgResult.insertId;
+
+    console.log(`\n==================== [REAL WA WEBHOOK] PROCESSED ====================`);
+    console.log(`phone_number_id=${instanceId || 'default'}`);
+    console.log(`wa_id=${sanitisedPhone}`);
+    console.log(`message_id=${wamid}`);
+    console.log(`message_type=${messageType || 'text'}`);
+    console.log(`message_text="${messageText}"`);
+    console.log(`organization_id=${activeOrgId}`);
+    console.log(`whatsapp_account_id=${activeAccountId}`);
+    console.log(`contact_id=${contactId}`);
+    console.log(`conversation_id=${conversationId}`);
+    console.log(`db_message_id=${insertedMsgId}`);
+    console.log(`socket_room=organization:${activeOrgId}`);
+    console.log(`socket_event=new_message`);
+    console.log(`====================================================================\n`);
+
+    const formattedMessage = {
+      id: insertedMsgId,
+      traceId: traceId || null,
+      conversationId,
+      conversation_id: conversationId,
+      organizationId: activeOrgId,
+      whatsappAccountId: activeAccountId,
+      wamid,
+      phone: sanitisedPhone,
+      text: messageText || '[Media message]',
+      message: messageText || '[Media message]',
+      sender: sender === 'user' ? 'bot' : 'contact',
+      direction: msgDirection,
+      messageType: messageType || 'text',
+      mediaId,
+      mediaUrl,
+      rawPayload,
+      caption: rawPayload?.templateSnapshot?.caption || messageText || '',
+      mediaType: rawPayload?.templateSnapshot?.header?.format || messageType || 'text',
+      templateName: rawPayload?.templateSnapshot?.templateName || null,
+      templateLanguage: rawPayload?.templateSnapshot?.templateLanguage || null,
+      templateHeader: rawPayload?.templateSnapshot?.header || null,
+      templateBody: rawPayload?.templateSnapshot?.body || null,
+      templateFooter: rawPayload?.templateSnapshot?.footer || null,
+      templateButtons: rawPayload?.templateSnapshot?.buttons || [],
+      campaignId: campaignId || null,
+      campaignName: rawPayload?.templateSnapshot?.campaignName || null,
+      timestamp: new Date().toISOString(),
+      status,
+      contactName,
+    };
+
+    const updatedConversation = {
+      id: conversationId,
+      traceId: traceId || null,
+      organizationId: activeOrgId,
+      whatsappAccountId: activeAccountId,
+      name: contactName,
+      phone: sanitisedPhone,
+      lastMessage: conversationPreview,
+      lastMessageTime: new Date().toISOString(),
+      unreadCount: newUnreadCount,
+      hasReplied,
+    };
+
+    // 8. EMIT LIVE SOCKET.IO EVENTS STRICTLY TO ORGANIZATION ROOM
+    if (activeOrgId) {
+      emitToOrganization(activeOrgId, 'new_message', formattedMessage);
+      emitToOrganization(activeOrgId, 'conversation_updated', updatedConversation);
+      console.log(`[WA SOCKET EMIT] traceId=${traceId || 'none'} room=organization:${activeOrgId} event=new_message`);
+    } else {
+      emitSocketEvent('new_message', formattedMessage);
+      emitSocketEvent('conversation_updated', updatedConversation);
+      console.log(`[WA SOCKET EMIT] traceId=${traceId || 'none'} room=global event=new_message`);
+    }
+
+    return { conversationId, messageId: insertedMsgId, message: formattedMessage, conversation: updatedConversation };
+  } catch (err) {
+    logger.error(`[ChatService] Failed to record chat message for ${phone}:`, err.message);
+    throw err;
+  }
+}

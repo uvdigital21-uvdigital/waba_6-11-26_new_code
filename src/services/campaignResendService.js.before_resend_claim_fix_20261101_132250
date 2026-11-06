@@ -1,0 +1,71 @@
+import { pool } from '../config/db.js';
+import { sendCentralTemplateMessage } from './templateMessageSenderService.js';
+import { emitToOrganization } from '../utils/socket.js';
+import logger from '../utils/logger.js';
+
+const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
+const json = (value, fallback) => {
+  if (!value) return fallback;
+  if (typeof value === 'object') return value;
+  try { return JSON.parse(value); } catch { return fallback; }
+};
+
+export async function processResendJob(jobId) {
+  const [[job]] = await pool.query('SELECT * FROM campaign_resend_jobs WHERE id=?', [jobId]);
+  if (!job || !['queued', 'running'].includes(job.status)) return;
+  await pool.query("UPDATE campaign_resend_jobs SET status='running',started_at=COALESCE(started_at,NOW()) WHERE id=?", [jobId]);
+  const [[campaign]] = await pool.query('SELECT * FROM campaigns WHERE id=?', [job.campaign_id]);
+  if (!campaign) return pool.query("UPDATE campaign_resend_jobs SET status='failed',error_message='Campaign not found',finished_at=NOW() WHERE id=?", [jobId]);
+  const [recipients] = await pool.query('SELECT * FROM campaign_recipients WHERE resend_job_id=? ORDER BY id', [jobId]);
+  const args = {
+    templateName: campaign.template_name,
+    languageCode: campaign.language_code || 'en_US',
+    components: json(campaign.components_json, []),
+    variables: json(campaign.variables_json, {}),
+    customMediaUrl: campaign.custom_media_url,
+    customCarouselMedia: json(campaign.carousel_media_json, null),
+    campaignId: campaign.id,
+    campaignName: campaign.campaign_name,
+    campaignType: 'resend', featureKey: 'general', userId: campaign.user_id || 1,
+    organizationId: campaign.organization_id, accountId: campaign.whatsapp_account_id
+  };
+  for (const recipient of recipients) {
+    await pool.query("UPDATE campaign_recipients SET status='sending' WHERE id=? AND resend_job_id=?", [recipient.id, jobId]);
+    const result = await sendCentralTemplateMessage({ ...args, recipient: recipient.phone });
+    if (result.success) {
+      await pool.query("UPDATE campaign_recipients SET message_id=?,status='sent',error=NULL,sent_at=NOW() WHERE id=? AND resend_job_id=?", [result.messageId, recipient.id, jobId]);
+      await pool.query('UPDATE campaign_resend_jobs SET sent_count=sent_count+1 WHERE id=?', [jobId]);
+    } else {
+      const code = result.details?.code || result.details?.error?.code || null;
+      const message = `${code ? `Meta Error ${code}: ` : ''}${result.message || 'Message send failed'}`;
+      const status = result.uncertain ? 'uncertain' : 'failed';
+
+      await pool.query(
+        "UPDATE campaign_recipients SET status=?,error=? WHERE id=? AND resend_job_id=?",
+        [status, message, recipient.id, jobId]
+      );
+
+      if (!result.uncertain) {
+        await pool.query(
+          'UPDATE campaign_resend_jobs SET failed_count=failed_count+1 WHERE id=?',
+          [jobId]
+        );
+      }
+
+      if (result.uncertain) {
+        logger.warn(`[CampaignResend] Unknown Meta outcome: job=${jobId}, recipient=${recipient.id}. Automatic retry disabled.`);
+      }
+    }
+    emitToOrganization(campaign.organization_id || 1, 'campaign_resend_updated', { campaignId: campaign.id, jobId });
+    await wait(Number(process.env.CAMPAIGN_RESEND_DELAY_MS || 300));
+  }
+  await pool.query("UPDATE campaign_resend_jobs SET status='awaiting_webhooks' WHERE id=?", [jobId]);
+  emitToOrganization(campaign.organization_id || 1, 'campaign_resend_updated', { campaignId: campaign.id, jobId, awaitingWebhooks: true });
+}
+
+export function startResendJob(jobId) {
+  setImmediate(() => processResendJob(jobId).catch(async err => {
+    logger.error(`[CampaignResend] Job ${jobId} failed: ${err.message}`);
+    await pool.query("UPDATE campaign_resend_jobs SET status='failed',error_message=?,finished_at=NOW() WHERE id=?", [err.message, jobId]).catch(() => {});
+  }));
+}

@@ -1,0 +1,47 @@
+import express from 'express';
+import asyncHandler from '../middleware/asyncHandler.js';
+import { getMetaTemplates, getMetaTemplateByName, getBusinessNumber } from '../controllers/metaTemplateController.js';
+import { createMetaTemplate, syncMetaTemplateStatuses } from '../controllers/whatsappTemplateController.js';
+import { requireAuth } from '../middleware/auth.js';
+
+import multer from 'multer';
+
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 25 * 1024 * 1024, fieldSize: 32 * 1024 * 1024 } // 25MB max
+});
+
+const router = express.Router();
+
+/**
+ * GET /api/meta/business-number
+ * Connected Meta WhatsApp Business phone number metadata
+ */
+router.get('/business-number', requireAuth, asyncHandler(getBusinessNumber));
+
+/**
+ * POST /api/meta/templates/create or /api/meta-templates/create
+ * Submit template directly to Meta Graph API for approval
+ */
+router.post('/create', requireAuth, upload.single('mediaFile'), asyncHandler(createMetaTemplate));
+
+/**
+ * GET /api/meta/templates/sync or /api/meta-templates/sync
+ * Sync live template approval statuses from Meta WABA
+ */
+router.get('/sync', requireAuth, asyncHandler(syncMetaTemplateStatuses));
+router.get('/templates/sync', requireAuth, asyncHandler(syncMetaTemplateStatuses));
+
+/**
+ * GET /api/meta-templates
+ * Fetch approved templates directly from Meta Graph API
+ */
+router.get('/', requireAuth, asyncHandler(getMetaTemplates));
+
+/**
+ * GET /api/meta-templates/:name
+ * Fetch a single template's full details (including components) by name
+ */
+router.get('/:name', requireAuth, asyncHandler(getMetaTemplateByName));
+
+export default router;

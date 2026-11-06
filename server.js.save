@@ -1,0 +1,178 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// server.js  —  Application entry point
+// ─────────────────────────────────────────────────────────────────────────────
+
+import express from 'express';
+import http from 'http';
+import cors from 'cors';
+import helmet from 'helmet';
+import morgan from 'morgan';
+import dotenv from 'dotenv';
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+// ── Force Indian Standard Time (IST) on all servers ──────────────────────────
+process.env.TZ = 'Asia/Kolkata';
+
+// ── Load environment variables FIRST ──────────────────────────────────────────
+dotenv.config({ path: path.join(__dirname, '.env') });
+dotenv.config();
+
+import { initSocket } from './src/utils/socket.js';
+import { runMultitenantMigrations } from './src/db/migrateAndSeed.js';
+import { initScheduler } from './src/services/schedulerService.js';
+import { startBirthdayScheduler } from './src/services/birthdaySchedulerService.js';
+
+// ── Routes ─────────────────────────────────────────────────────────────────────
+import authRoutes from './src/routes/authRoutes.js';
+import userRoutes from './src/routes/userRoutes.js';
+import teamRoutes from './src/routes/teamRoutes.js';
+import organizationRoutes from './src/routes/organizationRoutes.js';
+import whatsappAccountRoutes from './src/routes/whatsappAccountRoutes.js';
+import permissionRoutes from './src/routes/permissionRoutes.js';
+import dashboardRoutes from './src/routes/dashboardRoutes.js';
+
+import agentRoutes from './src/routes/agentRoutes.js';
+import agentReportRoutes from './src/routes/agentReportRoutes.js';
+import chatRoutes from './src/routes/chatRoutes.js';
+import templateRoutes from './src/routes/templateRoutes.js';
+import blacklistRoutes from './src/routes/blacklistRoutes.js';
+import tagRoutes from './src/routes/tagRoutes.js';
+import creditRoutes from './src/routes/creditRoutes.js';
+
+import webhookRoutes from './src/routes/webhook.js';
+import messageRoutes from './src/routes/message.js';
+import metaTemplateRoutes from './src/routes/metaTemplate.js';
+import metaBillingRoutes from './src/routes/metaBillingRoutes.js';
+import chatbotRoutes from './src/routes/chatbotRoutes.js';
+import developerApiRoutes from './src/routes/developerApiRoutes.js';
+import catalogRoutes from './src/routes/catalogRoutes.js';
+
+import requestLogger from './src/middleware/requestLogger.js';
+import errorHandler from './src/middleware/errorHandler.js';
+
+// ─────────────────────────────────────────────────────────────────────────────
+const app = express();
+
+// Serve uploaded files statically (both on /uploads and /api/uploads for reverse proxies)
+const uploadsPaths = [
+  path.join(__dirname, 'uploads'),
+  path.join(__dirname, '../uploads'),
+  path.join(process.cwd(), 'uploads'),
+  path.join(process.cwd(), 'backend', 'uploads')
+];
+
+uploadsPaths.forEach(p => {
+  if (fs.existsSync(p)) {
+    app.use('/uploads', express.static(p));
+    app.use('/api/uploads', express.static(p));
+  }
+});
+
+// Fallback for missing static images in uploads to return image.png instead of HTML 404
+const defaultFallbackImage = path.join(__dirname, 'uploads', 'image.png');
+app.get(['/uploads/*', '/api/uploads/*'], (req, res, next) => {
+  if (fs.existsSync(defaultFallbackImage)) {
+    res.setHeader('Content-Type', 'image/png');
+    return res.sendFile(defaultFallbackImage);
+  }
+  next();
+});
+
+// ── Security & Parsing ────────────────────────────────────────────────────────
+app.use(helmet({ contentSecurityPolicy: false }));
+app.use(cors({
+  origin: (origin, callback) => callback(null, true),
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'X-Account-ID', 'x-account-id', 'Accept', 'Origin']
+}));
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ extended: true, limit: '50mb' }));
+
+// ── HTTP request logging ──────────────────────────────────────────────────────
+app.use(morgan('dev'));
+app.use(requestLogger);
+
+// ── Health check ──────────────────────────────────────────────────────────────
+app.get('/api/health', (req, res) => res.json({ status: 'ok', timestamp: new Date().toISOString() }));
+
+// ── SaaS & Multi-Tenant Core Routes ───────────────────────────────────────────
+app.use('/api/auth', authRoutes);
+app.use('/api/users', userRoutes);
+app.use('/api/team-members', teamRoutes);
+app.use('/api/team', teamRoutes);
+app.use('/api/organizations', organizationRoutes);
+app.use('/api/whatsapp', whatsappAccountRoutes);
+app.use('/api/whatsapp-accounts', whatsappAccountRoutes);
+app.use('/api/numbers', whatsappAccountRoutes);
+app.use('/api/permissions', permissionRoutes);
+app.use('/api/dashboard', dashboardRoutes);
+
+// ── Operational Routes ────────────────────────────────────────────────────────
+app.use('/api/agents', agentRoutes);
+app.use('/api/agent-reports', agentReportRoutes);
+app.use('/api/chat', chatRoutes);
+app.use('/api/templates', templateRoutes);
+app.use('/api/blacklist', blacklistRoutes);
+app.use('/api/tags', tagRoutes);
+app.use('/api/credits', creditRoutes);
+app.use('/api/chatbot', chatbotRoutes);
+app.use('/api/catalogs', catalogRoutes);
+app.use('/api', developerApiRoutes);
+app.use('/api/app', mobileAppRoutes);
+app.use('/api/dashboard/app', mobileAppRoutes);
+app.use('/secure-download', mobileAppRoutes);
+
+// ── WhatsApp Webhook & Messaging ──────────────────────────────────────────────
+app.use('/webhook', webhookRoutes);
+app.use('/api/webhook', webhookRoutes);
+app.use('/api', messageRoutes);
+app.use('/api/meta-templates', metaTemplateRoutes);
+app.use('/api/meta/templates', metaTemplateRoutes);
+app.use('/api/meta', metaBillingRoutes);
+
+app.use(errorHandler);
+
+const server = http.createServer(app);
+initSocket(server);
+
+const PORT = process.env.PORT || 5000;
+
+server.listen(PORT, async () => {
+  console.log(`\n🚀 Server running on port ${PORT}`);
+  console.log(`================================================================================`);
+  console.log(`  [WEBHOOK CONFIGURATION & PUBLIC ACCESS GUIDE]`);
+  console.log(`  Backend Local Port: ${PORT}`);
+  console.log(`  Canonical Public Webhook Endpoint: POST /webhook`);
+  console.log(``);
+  console.log(`  To make your local backend reachable by Meta:`);
+  console.log(`    1. Run terminal command: ngrok http ${PORT}`);
+  console.log(`    2. Copy generated HTTPS URL: https://<NGROK-SUBDOMAIN>.ngrok-free.app/webhook`);
+  console.log(`    3. In Meta Developer Portal -> WhatsApp -> Configuration -> Edit Webhook:`);
+  console.log(`       - Callback URL: https://<NGROK-SUBDOMAIN>.ngrok-free.app/webhook`);
+  console.log(`       - Verify Token: my_super_secret_verify_token_2024`);
+  console.log(`    4. Ensure "messages" field checkbox is SUBSCRIBED.`);
+  console.log(`================================================================================\n`);
+
+  // Execute database migrations & seeders on startup
+  try {
+    await runMultitenantMigrations();
+  } catch (mErr) {
+    console.error('Migration startup error:', mErr);
+  }
+
+  // Initialize background campaign & birthday schedulers
+  try {
+    await initScheduler();
+    startBirthdayScheduler();
+  } catch (schedErr) {
+    console.error('Scheduler startup error:', schedErr);
+  }
+});
+
+export default app;

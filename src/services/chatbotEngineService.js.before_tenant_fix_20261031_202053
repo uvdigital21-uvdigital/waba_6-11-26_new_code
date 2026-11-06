@@ -1,0 +1,1014 @@
+import { pool } from '../config/db.js';
+import logger from '../utils/logger.js';
+import axios from 'axios';
+import { recordChatMessage } from './chatService.js';
+import { decryptToken } from '../utils/encryption.js';
+
+const MAX_STEPS = 40;               // infinite loop protection
+const SESSION_TTL_HOURS = 24;       // old waiting sessions are ignored after this
+const INTER_MESSAGE_DELAY_MS = 350; // keeps message order stable on WhatsApp
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const norm = (v) => String(v ?? '').trim().toLowerCase();
+const cleanPhoneNumber = (p) => String(p || '').replace(/[^0-9]/g, '');
+const escapeRe = (s) => String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+function safeJson(v, fallback = {}) {
+    if (!v) return fallback;
+    if (typeof v === 'object') return v;
+    try { return JSON.parse(v); } catch (_) { return fallback; }
+}
+
+function pick(obj, keys) {
+    for (const k of keys) {
+        if (obj && obj[k] !== undefined && obj[k] !== null && obj[k] !== '') return obj[k];
+    }
+    return undefined;
+}
+
+function pickText(data, keys, fallback) {
+    for (const k of keys) {
+        if (typeof data[k] === 'string' && data[k].trim()) return data[k];
+    }
+    return fallback;
+}
+
+function parseVariables(text, context = {}) {
+    if (!text || typeof text !== 'string') return '';
+    return text.replace(/\{\{\s*([\w.]+)\s*\}\}/g, (match, key) => {
+        const k = key.toLowerCase();
+        if (k === 'name') return context.name || context.contactName || 'Customer';
+        if (k === 'phone') return context.phone || 'N/A';
+        if (k === 'email') return context.email || 'N/A';
+        const v = context[key];
+        return v !== undefined && v !== null && typeof v !== 'object' ? String(v) : match;
+    });
+}
+
+function absoluteUrl(u) {
+    if (/^https?:\/\//i.test(u)) return u;
+    const base = (process.env.PUBLIC_URL || '').replace(/\/$/, '');
+    if (!base) logger.warn('[ChatbotEngine] PUBLIC_URL is not set in .env - Meta cannot download media from localhost!');
+    return `${base || 'http://localhost:5000'}${u.startsWith('/') ? u : `/${u}`}`;
+}
+
+/* ------------------------------------------------------------------ */
+/*  WhatsApp credentials + sending                                     */
+/* ------------------------------------------------------------------ */
+
+async function resolveCredentials(accountId) {
+    if (accountId) {
+        try {
+            const [rows] = await pool.execute('SELECT * FROM whatsapp_accounts WHERE id = ? LIMIT 1', [accountId]);
+            const acc = rows[0];
+            if (acc) {
+                const phoneNumberId = acc.phone_number_id || acc.phoneNumberId || null;
+                let token = null;
+                try { token = acc.access_token ? decryptToken(acc.access_token) : null; } catch (_) { token = null; }
+                if (phoneNumberId && token) {
+                    return {
+                        phoneNumberId,
+                        wabaId: acc.waba_id || null,
+                        token,
+                        version: process.env.API_VERSION || 'v19.0',
+                        organizationId: acc.organization_id || null,
+                        accountId: acc.id
+                    };
+                }
+                logger.warn(`[ChatbotEngine] Account ${accountId} has no usable phone_number_id/access_token, falling back to .env`);
+            }
+        } catch (err) {
+            logger.warn(`[ChatbotEngine] Failed to load whatsapp account ${accountId}: ${err.message}`);
+        }
+    }
+
+    const phoneNumberId = process.env.PHONE_NUMBER_ID;
+    const token = process.env.ACCESS_TOKEN;
+    if (!phoneNumberId || !token) {
+        logger.error('[ChatbotEngine] No WhatsApp credentials available (account or .env)');
+        return null;
+    }
+    return {
+        phoneNumberId,
+        token,
+        version: process.env.API_VERSION || 'v19.0',
+        organizationId: null,
+        accountId: accountId || null
+    };
+}
+
+
+function cleanInteractivePayload(payload) {
+    if (!payload || payload.type !== 'interactive') return payload;
+
+    const i = payload.interactive;
+    if (!i) return payload;
+
+    const clean = (value, max) =>
+        String(value ?? '')
+            .replace(/[*_~`]/g, '')
+            .replace(/\\s+/g, ' ')
+            .trim()
+            .slice(0, max);
+
+    if (i.header?.type === 'text') {
+        i.header.text = clean(i.header.text, 60);
+        if (!i.header.text) delete i.header;
+    }
+
+    if (i.footer?.text) {
+        i.footer.text = clean(i.footer.text, 60);
+    }
+
+    if (i.type === 'list') {
+        for (const section of i.action?.sections || []) {
+            section.title = clean(section.title, 24);
+        }
+    }
+
+    return payload;
+}
+
+
+// Automatic WhatsApp Phone Call CTA Templates
+const callTemplateChecks = new Map();
+
+async function ensureCallTemplate(creds, phoneNumber) {
+    if (!creds.wabaId || !creds.token || !creds.accountId) {
+        logger.warn('[CallCTA] WABA credentials unavailable');
+        return null;
+    }
+
+    const digits = cleanPhoneNumber(phoneNumber);
+
+    if (digits.length < 8 || digits.length > 15) {
+        logger.warn('[CallCTA] Invalid phone number');
+        return null;
+    }
+
+    const templateName =
+        `chatbot_call_${creds.accountId}_${digits}`;
+
+    const cacheKey = `${creds.wabaId}:${templateName}`;
+    const cached = callTemplateChecks.get(cacheKey);
+
+    if (cached && cached.expires > Date.now()) {
+        return cached.promise;
+    }
+
+    const promise = (async () => {
+        const endpoint =
+            `https://graph.facebook.com/${creds.version}/${creds.wabaId}/message_templates`;
+
+        const headers = {
+            Authorization: `Bearer ${creds.token}`
+        };
+
+        try {
+            const result = await axios.get(endpoint, {
+                headers,
+                params: {
+                    name: templateName,
+                    fields: 'name,status,language,components',
+                    limit: 10
+                },
+                timeout: 10000
+            });
+
+            const found = (result.data?.data || []).find(
+                t => t.name === templateName &&
+                     t.language === 'en_US'
+            );
+
+            if (found) {
+                const phoneButtons = (found.components || [])
+                    .filter(c => c.type === 'BUTTONS')
+                    .flatMap(c => c.buttons || [])
+                    .filter(b => b.type === 'PHONE_NUMBER');
+
+                const valid = phoneButtons.some(
+                    b => cleanPhoneNumber(b.phone_number) === digits
+                );
+
+                if (!valid) {
+                    logger.error(
+                        `[CallCTA] Phone mismatch: ${templateName}`
+                    );
+                    return null;
+                }
+
+                logger.info(
+                    `[CallCTA] ${templateName} status=${found.status}`
+                );
+
+                return found.status === 'APPROVED'
+                    ? templateName
+                    : null;
+            }
+
+            const payload = {
+                name: templateName,
+                language: 'en_US',
+                category: 'UTILITY',
+                components: [
+                    {
+                        type: 'BODY',
+                        text: 'Contact our team using the Call Now button below.'
+                    },
+                    {
+                        type: 'BUTTONS',
+                        buttons: [
+                            {
+                                type: 'PHONE_NUMBER',
+                                text: 'Call Now',
+                                phone_number: `+${digits}`
+                            }
+                        ]
+                    }
+                ]
+            };
+
+            const created = await axios.post(
+                endpoint,
+                payload,
+                {
+                    headers,
+                    timeout: 12000
+                }
+            );
+
+            const status = created.data?.status || 'PENDING';
+
+            logger.info(
+                `[CallCTA] Submitted ${templateName}; status=${status}`
+            );
+
+            return status === 'APPROVED'
+                ? templateName
+                : null;
+
+        } catch (err) {
+            logger.warn(
+                `[CallCTA] Account ${creds.accountId}: ` +
+                JSON.stringify(
+                    err.response?.data?.error || err.message
+                )
+            );
+
+            return null;
+        }
+    })();
+
+    callTemplateChecks.set(cacheKey, {
+        promise,
+        expires: Date.now() + 5 * 60 * 1000
+    });
+
+    return promise;
+}
+
+async function sendWhatsAppMessage({ creds, phone, payload, organizationId }) {
+    const url = `https://graph.facebook.com/${creds.version}/${creds.phoneNumberId}/messages`;
+    const cleanPhone = cleanPhoneNumber(phone);
+
+    try {
+        const response = await axios.post(
+            url,
+            { messaging_product: 'whatsapp', to: cleanPhone, ...cleanInteractivePayload(payload) },
+            {
+                headers: { Authorization: `Bearer ${creds.token}`, 'Content-Type': 'application/json' },
+                timeout: 20000
+            }
+        );
+        const messageId = response.data?.messages?.[0]?.id || null;
+
+        // Recording must never break the flow
+        try {
+            const preview =
+                payload.text?.body ||
+                payload.interactive?.body?.text ||
+                (payload.template ? `[Template: ${payload.template.name}]` : null) ||
+                payload[payload.type]?.caption ||
+                `[${payload.type || 'message'}]`;
+
+            await recordChatMessage({
+                userId: 1,
+                organizationId: organizationId || creds.organizationId || null,
+                whatsappAccountId: creds.accountId || null,
+                phone: cleanPhone,
+                messageText: preview,
+                wamid: messageId,
+                sender: 'user',
+                direction: 'outgoing',
+                messageType: payload.type === 'interactive' ? 'text' : (payload.type || 'text'),
+                status: 'sent'
+            });
+        } catch (recErr) {
+            logger.warn(`[ChatbotEngine] recordChatMessage failed: ${recErr.message}`);
+        }
+
+        return messageId;
+    } catch (err) {
+        logger.error('[ChatbotEngine] Meta API send failed:', err.response?.data || err.message);
+        return null;
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/*  Node data helpers (shared by sender + reply matcher)               */
+/* ------------------------------------------------------------------ */
+
+const TITLE_KEYS = ['title', 'text', 'label', 'name', 'value'];
+const hasTitle = (o) => o && typeof o === 'object' && !Array.isArray(o) &&
+    TITLE_KEYS.some((k) => typeof o[k] === 'string' && o[k].trim());
+
+function deepFindArray(obj, test, depth = 0) {
+    if (!obj || typeof obj !== 'object' || depth > 4) return null;
+    if (Array.isArray(obj)) {
+        if (obj.length && obj.every(test)) return obj;
+        for (const v of obj) { const f = deepFindArray(v, test, depth + 1); if (f) return f; }
+        return null;
+    }
+    for (const v of Object.values(obj)) { const f = deepFindArray(v, test, depth + 1); if (f) return f; }
+    return null;
+}
+
+function normalizeButtons(data) {
+    let src = Array.isArray(data.buttons) ? data.buttons : null;
+    if (!src) {
+        const alt = pick(data, ['quickReplies', 'quick_replies', 'options', 'actions']);
+        src = Array.isArray(alt) ? alt : [];
+    }
+    return src
+        .map((b, i) => {
+            if (typeof b === 'string') b = { text: b };
+            const title = b && (b.text || b.title || b.label || b.name);
+            if (!title) return null;
+            return { id: String(b.id || `btn_${i}`).slice(0, 200), text: String(title).slice(0, 20) };
+        })
+        .filter(Boolean)
+        .slice(0, 3);
+}
+
+function normalizeRow(r, si, ri) {
+    if (typeof r === 'string') r = { title: r };
+    const title = pick(r, ['title', 'text', 'label', 'name', 'value']);
+    if (!title) return null;
+    const id = pick(r, ['id', 'rowId', 'row_id', 'value']) ?? `row_${si}_${ri}`;
+    const description = String(pick(r, ['description', 'desc', 'subtitle']) || '').slice(0, 72);
+    return {
+        id: String(id).slice(0, 200),
+        title: String(title).slice(0, 24),
+        ...(description ? { description } : {})
+    };
+}
+
+function normalizeSections(data) {
+    const ROW_KEYS = ['rows', 'items', 'options', 'listItems', 'list_items', 'choices'];
+    const isSection = (s) => s && typeof s === 'object' && !Array.isArray(s) &&
+        ROW_KEYS.some((k) => Array.isArray(s[k]) && s[k].some((r) => typeof r === 'string' || hasTitle(r)));
+
+    let sections = null;
+    const known = pick(data, ['sections', 'listSections']);
+    if (Array.isArray(known) && known.some(isSection)) sections = known;
+
+    if (!sections) {
+        const nested = deepFindArray(data, isSection);
+        if (nested) sections = nested;
+    }
+    if (!sections) {
+        const flatKnown = pick(data, ROW_KEYS);
+        const flat = Array.isArray(flatKnown) && flatKnown.length
+            ? flatKnown
+            : deepFindArray(data, (r) => typeof r === 'string' || hasTitle(r));
+        if (flat) sections = [{ title: 'Options', rows: flat }];
+    }
+    if (!sections) return [];
+
+    let total = 0;
+    const out = [];
+    sections.forEach((s, si) => {
+        const rows = [];
+        (pick(s, ROW_KEYS) || []).forEach((r, ri) => {
+            if (total >= 10) return; // Meta limit: 10 rows total
+            const row = normalizeRow(r, si, ri);
+            if (row) { rows.push(row); total++; }
+        });
+        if (rows.length) out.push({ title: String(s.title || 'Options').slice(0, 24), rows });
+    });
+    return out;
+}
+
+function buildButtonPayload(body, buttons, header = null) {
+    return {
+        type: 'interactive',
+        interactive: {
+            type: 'button',
+            ...(header ? { header } : {}),
+            body: { text: String(body).slice(0, 1024) },
+            action: {
+                buttons: buttons.map((b) => ({ type: 'reply', reply: { id: b.id, title: b.text } }))
+            }
+        }
+    };
+}
+
+/* ------------------------------------------------------------------ */
+/*  Reply -> edge matching                                             */
+/* ------------------------------------------------------------------ */
+
+function handleMatches(handle, candidates) {
+    const h = norm(handle);
+    if (!h) return false;
+    return candidates.some((c) => {
+        const x = norm(c);
+        if (!x) return false;
+        if (h === x) return true;
+        return new RegExp(`(^|[-_:|/])${escapeRe(x)}($|[-_:|/])`).test(h);
+    });
+}
+
+function getSelection(node, data, reply) {
+    const sel = { choice: false, matched: false, ids: [], texts: [], indexForms: [] };
+    const keys = [norm(reply.buttonPayload || reply.listPayload), norm(reply.typedText)].filter(Boolean);
+
+    const test = (id, title) => {
+        const variants = [norm(title), norm(title).slice(0, 20), norm(title).slice(0, 24)];
+        return keys.some((k) => k === norm(id) || variants.includes(k));
+    };
+
+    if (node.type === 'list_message') {
+        sel.choice = true;
+        let flat = 0;
+        normalizeSections(data).forEach((s, si) => s.rows.forEach((r, ri) => {
+            if (test(r.id, r.title)) {
+                sel.matched = true;
+                sel.ids.push(r.id);
+                sel.texts.push(r.title);
+                sel.indexForms.push(
+                    `row_${flat}`, `row-${flat}`, `item_${flat}`, `item-${flat}`, `option_${flat}`, `option-${flat}`,
+                    `handle-${flat}`, `${flat}`, `${si}-${ri}`, `row_${si}_${ri}`, `row-${si}-${ri}`
+                );
+            }
+            flat++;
+        }));
+    } else {
+        const buttons = normalizeButtons(data);
+        if (buttons.length) {
+            sel.choice = true;
+            buttons.forEach((b, i) => {
+                if (test(b.id, b.text)) {
+                    sel.matched = true;
+                    sel.ids.push(b.id);
+                    sel.texts.push(b.text);
+                    sel.indexForms.push(`btn_${i}`, `btn-${i}`, `button-${i}`, `button_${i}`, `option-${i}`, `option_${i}`, `handle-${i}`, `${i}`);
+                }
+            });
+        }
+    }
+    return sel;
+}
+
+/** Returns an array of edges to follow, or null if the reply was not understood. */
+function pickReplyEdges(node, data, outEdges, reply) {
+    const sel = getSelection(node, data, reply);
+    const byHandle = (cands) => outEdges.filter((e) => handleMatches(e.sourceHandle, cands));
+
+    logger.info(`[ChatbotEngine] Reply match on node ${node.node_id}: matched=${sel.matched} ids=${JSON.stringify(sel.ids)} edgeHandles=${JSON.stringify(outEdges.map((e) => e.sourceHandle))}`);
+
+    if (sel.choice) {
+        if (!sel.matched) return null;
+        for (const cands of [sel.ids, sel.texts, sel.indexForms]) {
+            const m = byHandle(cands);
+            if (m.length) return m;
+        }
+        const generic = outEdges.filter((e) => !e.sourceHandle);
+        if (generic.length) return generic;
+        // Last resort: node has only one connection -> follow it
+        if (outEdges.length === 1) return outEdges;
+        logger.warn(`[ChatbotEngine] No edge matched for node ${node.node_id}. Row id(s): ${JSON.stringify(sel.ids)} vs handles: ${JSON.stringify(outEdges.map((e) => e.sourceHandle))}`);
+        return [];
+    }
+
+    // location / form / etc: any reply continues
+    const generic = outEdges.filter((e) => !e.sourceHandle);
+    return generic.length ? generic : outEdges;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Graph + flow lookup                                                */
+/* ------------------------------------------------------------------ */
+
+async function loadGraph(flowId) {
+    const [nodes] = await pool.execute(
+        `SELECT node_id, type, data FROM chatbot_nodes WHERE flow_id = ?`,
+        [flowId]
+    );
+    const [edges] = await pool.execute(
+        `SELECT id, source, target, source_handle AS sourceHandle FROM chatbot_edges WHERE flow_id = ? ORDER BY id ASC`,
+        [flowId]
+    );
+
+    const nodeMap = new Map();
+    nodes.forEach((n) => {
+        if (n.type === 'text_list') n.type = 'list_message';
+        nodeMap.set(n.node_id, n);
+    });
+    const outgoing = new Map();
+    const incoming = new Set();
+    edges.forEach((e) => {
+        if (!outgoing.has(e.source)) outgoing.set(e.source, []);
+        outgoing.get(e.source).push(e);
+        incoming.add(e.target);
+    });
+    return { nodes: nodeMap, outgoing, incoming };
+}
+
+function findStartNodeId(graph) {
+    for (const n of graph.nodes.values()) if (n.type === 'starting_keyword') return n.node_id;
+    for (const n of graph.nodes.values()) if (!graph.incoming.has(n.node_id)) return n.node_id;
+    const first = graph.nodes.values().next().value;
+    return first ? first.node_id : null;
+}
+
+async function findFlowByKeyword(keyword, { accountId, organizationId }) {
+    if (!keyword) return null;
+    const base = `SELECT f.id AS flow_id, f.whatsapp_account_id, f.company_id
+                  FROM chatbot_keywords k
+                  JOIN chatbot_flows f ON f.id = k.flow_id
+                  WHERE LOWER(TRIM(k.keyword)) = ?
+                    AND (f.status IS NULL OR f.status = 'active')`;
+    // lower priority number = runs first. Change ASC -> DESC if your UI treats a higher number as more important.
+    const order = ` ORDER BY (f.whatsapp_account_id IS NULL) ASC, f.priority ASC, f.id DESC LIMIT 1`;
+
+    const scopes = [];
+    if (accountId) scopes.push({ sql: ' AND (f.whatsapp_account_id = ? OR f.whatsapp_account_id IS NULL)', val: accountId });
+    if (organizationId) scopes.push({ sql: ' AND f.company_id = ?', val: organizationId });
+    if (!scopes.length) scopes.push({ sql: '', val: null });
+
+    for (const scope of scopes) {
+        const params = [keyword];
+        if (scope.val !== null) params.push(scope.val);
+        const [rows] = await pool.execute(base + scope.sql + order, params);
+        if (rows.length) return rows[0];
+    }
+    return null;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Node execution                                                     */
+/* ------------------------------------------------------------------ */
+
+async function executeNode(node, env) {
+    const { phone, context, graph, reply } = env;
+    const data = safeJson(node.data, {});
+    const outEdges = graph.outgoing.get(node.node_id) || [];
+    const allTargets = () => [...new Set(outEdges.map((e) => e.target))];
+    const send = (payload) => env.send(payload);
+
+    logger.info(`[ChatbotEngine] Executing node "${node.node_id}" (${node.type})`);
+
+    switch (node.type) {
+        case 'starting_keyword':
+            return { next: allTargets() };
+
+        case 'text_reply': {
+            await send({ type: 'text', text: { body: parseVariables(pickText(data, ['message', 'body', 'text'], 'Hello!'), context).slice(0, 4096) } });
+            return { next: allTargets() };
+        }
+
+        case 'text_button': {
+            const bodyText = parseVariables(pickText(data, ['message', 'body', 'text'], 'Please select an option:'), context);
+            const buttons = normalizeButtons(data);
+            if (buttons.length) {
+                await send(buildButtonPayload(bodyText, buttons));
+                return { wait: true };
+            }
+            await send({ type: 'text', text: { body: bodyText.slice(0, 4096) } });
+            // Branching node without readable buttons: do NOT fire every branch
+            if (outEdges.some((e) => e.sourceHandle)) {
+                logger.error(`[ChatbotEngine] Button node ${node.node_id} has branches but no buttons found. data=${JSON.stringify(data).slice(0, 800)}`);
+                return { end: true };
+            }
+            return { next: allTargets() };
+        }
+
+        case 'media_button': {
+            const buttons = normalizeButtons(data);
+            const caption = parseVariables(pickText(data, ['caption', 'message', 'body'], ''), context);
+            const mediaType = ['image', 'video', 'document', 'audio'].includes(data.mediaType) ? data.mediaType : 'image';
+            const mediaUrl = data.mediaUrl ? absoluteUrl(data.mediaUrl) : '';
+
+            if (mediaUrl && buttons.length && mediaType !== 'audio') {
+                await send(buildButtonPayload(caption || 'Please select an option:', buttons, {
+                    type: mediaType,
+                    [mediaType]: { link: mediaUrl }
+                }));
+                return { wait: true };
+            }
+            if (mediaUrl) {
+                await send({
+                    type: mediaType,
+                    [mediaType]: mediaType === 'audio' ? { link: mediaUrl } : { link: mediaUrl, ...(caption ? { caption } : {}) }
+                });
+            }
+            if (buttons.length) {
+                await send(buildButtonPayload(caption || 'Please select an option:', buttons));
+                return { wait: true };
+            }
+            return { next: allTargets() };
+        }
+
+        case 'url_button': {
+            const caption = parseVariables(
+                pickText(data, ['caption', 'message', 'body'], 'Contact us'),
+                context
+            );
+
+            const rawUrl = parseVariables(
+                String(pick(data, ['url', 'link', 'buttonUrl']) || ''),
+                context
+            ).trim();
+
+            const buttonLabel = String(
+                pick(data, ['buttonText', 'buttonLabel', 'label', 'title']) ||
+                'Open Link'
+            ).replace(/[*_~`]/g, '').trim().slice(0, 20);
+
+            const phoneNumber = cleanPhoneNumber(
+                pick(data, ['phoneNumber', 'phone', 'callNumber']) ||
+                (/^tel:/i.test(rawUrl) ? rawUrl.slice(4) : '')
+            );
+
+            if (phoneNumber && /^tel:/i.test(rawUrl)) {
+                const templateName = await ensureCallTemplate(env.creds, phoneNumber);
+
+                if (templateName) {
+                    const sent = await send({
+                        type: 'template',
+                        template: {
+                            name: templateName,
+                            language: { code: 'en_US' }
+                        }
+                    });
+
+                    if (!sent) {
+                        logger.error(`[CallCTA] Send failed for ${node.node_id}`);
+                    }
+                } else {
+                    logger.warn(`[CallCTA] Template not yet approved for ${node.node_id}`);
+                }
+
+                return { next: allTargets() };
+            }
+
+            const normalizedUrl = /^https?:\/\//i.test(rawUrl)
+                ? rawUrl
+                : `https://${rawUrl}`;
+
+            if (/^https:\/\/[^\s]+$/i.test(normalizedUrl)) {
+                const sent = await send({
+                    type: 'interactive',
+                    interactive: {
+                        type: 'cta_url',
+                        body: {
+                            text: (caption || 'Open the link below')
+                                .slice(0, 1024)
+                        },
+                        action: {
+                            name: 'cta_url',
+                            parameters: {
+                                display_text: buttonLabel || 'Open Link',
+                                url: normalizedUrl
+                            }
+                        }
+                    }
+                });
+
+                if (!sent) {
+                    await send({
+                        type: 'text',
+                        text: {
+                            body: `${caption}\n\n${normalizedUrl}`.slice(0, 4096),
+                            preview_url: true
+                        }
+                    });
+                }
+
+                return { next: allTargets() };
+            }
+
+            logger.warn(
+                `[ChatbotEngine] Invalid URL in node ${node.node_id}`
+            );
+
+            if (caption) {
+                await send({
+                    type: 'text',
+                    text: { body: caption.slice(0, 4096) }
+                });
+            }
+
+            return { next: allTargets() };
+        }
+
+        case 'list_message': {
+            const bodyText = parseVariables(pickText(data, ['body', 'message', 'text'], 'Select from list:'), context);
+            const sections = normalizeSections(data);
+
+            if (!sections.length) {
+                logger.error(`[ChatbotEngine] List node ${node.node_id} has NO rows. data=${JSON.stringify(data).slice(0, 1200)}`);
+                await send({ type: 'text', text: { body: bodyText.slice(0, 4096) } });
+                return { end: true }; // stop here, never fire all branches
+            }
+
+            await send({
+                type: 'interactive',
+                interactive: {
+                    type: 'list',
+                    ...(data.header ? { header: { type: 'text', text: String(data.header).replace(/[*_~`]/g, '').replace(/\s+/g, ' ').trim().slice(0, 60) } } : {}),
+                    body: { text: bodyText.slice(0, 1024) },
+                    ...(data.footer ? { footer: { text: String(data.footer).replace(/[*_~`]/g, '').replace(/\s+/g, ' ').trim().slice(0, 60) } } : {}),
+                    action: {
+                        button: String(data.buttonText || data.buttonLabel || data.button || 'View Options').slice(0, 20),
+                        sections
+                    }
+                }
+            });
+            return { wait: true };
+        }
+
+        case 'request_location': {
+            await send({ type: 'text', text: { body: parseVariables(pickText(data, ['message', 'body'], 'Please share your location pin on WhatsApp.'), context) } });
+            return { wait: true };
+        }
+
+        case 'whatsapp_form': {
+            await send({ type: 'text', text: { body: parseVariables(pickText(data, ['message', 'body'], 'Please complete the requested information form.'), context) } });
+            return { wait: true };
+        }
+
+        case 'template': {
+            if (data.templateName) {
+                await send({
+                    type: 'template',
+                    template: {
+                        name: data.templateName,
+                        language: { code: data.languageCode || 'en_US' },
+                        ...(Array.isArray(data.components) && data.components.length ? { components: data.components } : {})
+                    }
+                });
+            }
+            return { next: allTargets() };
+        }
+
+        case 'add_group': {
+            if (data.groupId) {
+                await pool.execute(`INSERT IGNORE INTO contact_groups (group_id, phone) VALUES (?, ?)`, [data.groupId, phone])
+                    .catch((e) => logger.warn(`[ChatbotEngine] add_group failed: ${e.message}`));
+            }
+            return { next: allTargets() };
+        }
+
+        case 'add_tag': {
+            if (data.tagId) {
+                await pool.execute(`INSERT IGNORE INTO contact_tags (tag_id, phone) VALUES (?, ?)`, [data.tagId, phone])
+                    .catch((e) => logger.warn(`[ChatbotEngine] add_tag failed: ${e.message}`));
+            }
+            return { next: allTargets() };
+        }
+
+        case 'push_webhook': {
+            if (data.webhookUrl) {
+                try {
+                    const method = (data.method || 'POST').toLowerCase();
+                    const headers = data.headers ? safeJson(data.headers, {}) : {};
+                    const body = data.body ? safeJson(parseVariables(data.body, context), { phone, context }) : { phone, context };
+                    await axios({ method, url: data.webhookUrl, headers, data: body, timeout: 5000 });
+                } catch (wErr) {
+                    logger.error('[ChatbotEngine] Webhook push failed:', wErr.message);
+                }
+            }
+            return { next: allTargets() };
+        }
+
+        case 'create_ticket': {
+            await pool.execute(
+                `INSERT INTO support_tickets (phone, department, priority, status, created_at) VALUES (?, ?, ?, 'open', NOW())`,
+                [phone, data.department || 'General', data.priority || 'Medium']
+            ).catch((e) => logger.warn(`[ChatbotEngine] create_ticket failed: ${e.message}`));
+            return { next: allTargets() };
+        }
+
+        case 'connect_agent': {
+            await pool.execute(
+                `UPDATE conversations SET assigned_agent_id = ? WHERE contact_phone = ?`,
+                [data.agentId || 1, phone]
+            ).catch((e) => logger.warn(`[ChatbotEngine] connect_agent failed: ${e.message}`));
+            await send({ type: 'text', text: { body: 'You have been connected to a live support agent.' } });
+            return { next: allTargets() };
+        }
+
+        case 'delay': {
+            const totalSecs = (Number(data.hours || 0) * 3600) + (Number(data.minutes || 0) * 60) + Number(data.seconds || 0);
+            if (totalSecs > 0 && totalSecs <= 60) await sleep(totalSecs * 1000);
+            return { next: allTargets() };
+        }
+
+        case 'condition': {
+            const varVal = norm(context[data.variable || 'message'] ?? reply.inputStr ?? '');
+            const compareVal = norm(data.value);
+            const operator = data.operator || 'equals';
+
+            let isTrue = false;
+            if (operator === 'equals') isTrue = varVal === compareVal;
+            else if (operator === 'not_equals') isTrue = varVal !== compareVal;
+            else if (operator === 'contains') isTrue = varVal.includes(compareVal);
+            else if (operator === 'not_contains') isTrue = !varVal.includes(compareVal);
+            else if (operator === 'starts_with') isTrue = varVal.startsWith(compareVal);
+            else if (operator === 'ends_with') isTrue = varVal.endsWith(compareVal);
+
+            const wanted = isTrue ? ['true', 'if', 'yes'] : ['false', 'else', 'no'];
+            const branch = outEdges.find((e) => wanted.includes(norm(e.sourceHandle)));
+            const fallback = outEdges.find((e) => !e.sourceHandle) || null;
+            const chosen = branch || (isTrue ? fallback : null);
+            return { next: chosen ? [chosen.target] : [] };
+        }
+
+        case 'end_flow':
+            return { end: true };
+
+        default:
+            logger.warn(`[ChatbotEngine] Unknown node type "${node.type}", skipping to next nodes`);
+            return { next: allTargets() };
+    }
+}
+
+/**
+ * Runs nodes one after another until the flow hits a node that needs
+ * a user reply (buttons / list / location / form) or the flow finishes.
+ */
+async function runNodes({ startNodeIds, env }) {
+    const queue = [...startNodeIds];
+    let waitingNodeId = null;
+    let ended = false;
+    let steps = 0;
+
+    while (queue.length && steps < MAX_STEPS) {
+        const nodeId = queue.shift();
+        const node = env.graph.nodes.get(nodeId);
+        if (!node) continue;
+        steps++;
+
+        const result = await executeNode(node, env);
+        if (result.end) { ended = true; break; }
+        if (result.wait) { waitingNodeId = node.node_id; continue; }
+        if (result.next?.length) queue.push(...result.next);
+    }
+
+    if (steps >= MAX_STEPS) logger.warn('[ChatbotEngine] MAX_STEPS reached - possible loop in flow');
+    return { waitingNodeId, ended };
+}
+
+/* ------------------------------------------------------------------ */
+/*  Main entry point (called by the webhook)                           */
+/* ------------------------------------------------------------------ */
+
+export async function processIncomingChatbotMessage({
+    phone,
+    messageText = '',
+    buttonPayload = null,
+    listPayload = null,
+    locationPayload = null,
+    accountId = null,        // whatsapp_accounts.id that RECEIVED the message
+    organizationId = null,
+    contactName = null
+}) {
+    try {
+        const cleanPhone = cleanPhoneNumber(phone);
+        const typedText = norm(messageText);
+        const inputStr = norm(messageText || buttonPayload || listPayload || '');
+        const isInteractiveReply = Boolean(buttonPayload || listPayload || locationPayload);
+
+        logger.info(`[ChatbotEngine] Incoming from ${cleanPhone}: "${inputStr}"`);
+
+        // Active (non-expired) waiting session
+        const [sessions] = await pool.execute(
+            `SELECT flow_id, current_node_id, context FROM chatbot_user_sessions
+             WHERE phone = ? AND updated_at >= DATE_SUB(NOW(), INTERVAL ${SESSION_TTL_HOURS} HOUR) LIMIT 1`,
+            [cleanPhone]
+        );
+        const session = sessions[0] || null;
+        logger.info(`[ChatbotEngine] session=${session ? session.current_node_id : 'NONE'} isInteractive=${isInteractiveReply} text="${typedText}"`);
+
+        // A button/list tap continues the current flow; plain text may start a new flow by keyword
+        let keywordFlow = null;
+        if (!(isInteractiveReply && session)) {
+            keywordFlow = await findFlowByKeyword(inputStr, { accountId, organizationId });
+        }
+
+        let flowId;
+        let context;
+        let isNewRun = false;
+
+        if (keywordFlow) {
+            flowId = keywordFlow.flow_id;
+            context = { phone: cleanPhone, ...(contactName ? { name: contactName } : {}) };
+            isNewRun = true;
+        } else if (session) {
+            flowId = session.flow_id;
+            context = safeJson(session.context, {});
+            if (contactName && !context.name) context.name = contactName;
+        } else {
+            logger.info(`[ChatbotEngine] No flow matched "${inputStr}" from ${cleanPhone}`);
+            return false;
+        }
+
+        // Flow must exist and be active
+        const [flowRows] = await pool.execute(
+            `SELECT id, company_id, whatsapp_account_id, status FROM chatbot_flows WHERE id = ? LIMIT 1`,
+            [flowId]
+        );
+        const flow = flowRows[0];
+        if (!flow || (flow.status && flow.status !== 'active')) {
+            await pool.execute(`DELETE FROM chatbot_user_sessions WHERE phone = ?`, [cleanPhone]);
+            return false;
+        }
+
+        const creds = await resolveCredentials(accountId || flow.whatsapp_account_id);
+        if (!creds) return false;
+        const orgId = creds.organizationId || organizationId || flow.company_id || null;
+
+        const graph = await loadGraph(flowId);
+        if (!graph.nodes.size) {
+            logger.warn(`[ChatbotEngine] Flow ${flowId} has no nodes`);
+            return false;
+        }
+
+        context.phone = cleanPhone;
+        context.message = inputStr;
+        if (locationPayload) context.location = locationPayload;
+
+        const reply = { buttonPayload, listPayload, locationPayload, typedText, inputStr };
+        let sentCount = 0;
+        const env = {
+            phone: cleanPhone,
+            creds,
+            context,
+            graph,
+            reply,
+            send: async (payload) => {
+                if (sentCount++ > 0) await sleep(INTER_MESSAGE_DELAY_MS);
+                return sendWhatsAppMessage({ creds, phone: cleanPhone, payload, organizationId: orgId });
+            }
+        };
+
+        let startNodeIds = [];
+
+        if (isNewRun) {
+            const startId = findStartNodeId(graph);
+            if (!startId) return false;
+            startNodeIds = [startId];
+
+            pool.execute(
+                `UPDATE chatbot_flows SET execution_count = COALESCE(execution_count, 0) + 1, last_executed_at = NOW() WHERE id = ?`,
+                [flowId]
+            ).catch(() => { });
+        } else {
+            // Resume: session.current_node_id is the node that is WAITING for the user's answer
+            const waitingNode = graph.nodes.get(session.current_node_id);
+            if (!waitingNode) {
+                await pool.execute(`DELETE FROM chatbot_user_sessions WHERE phone = ?`, [cleanPhone]);
+                return false;
+            }
+            const waitingData = safeJson(waitingNode.data, {});
+            const outEdges = graph.outgoing.get(waitingNode.node_id) || [];
+            const chosen = pickReplyEdges(waitingNode, waitingData, outEdges, reply);
+
+            if (chosen === null) {
+                logger.info(`[ChatbotEngine] Reply "${inputStr}" does not match any option of node ${waitingNode.node_id}`);
+                return false;
+            }
+            context.lastReply = inputStr;
+            startNodeIds = [...new Set(chosen.map((e) => e.target))];
+        }
+
+        const { waitingNodeId, ended } = await runNodes({ startNodeIds, env });
+
+        if (waitingNodeId && !ended) {
+            await pool.execute(
+                `INSERT INTO chatbot_user_sessions (phone, flow_id, current_node_id, context, updated_at)
+                 VALUES (?, ?, ?, ?, NOW())
+                 ON DUPLICATE KEY UPDATE flow_id = VALUES(flow_id), current_node_id = VALUES(current_node_id), context = VALUES(context), updated_at = NOW()`,
+                [cleanPhone, flowId, waitingNodeId, JSON.stringify(context)]
+            );
+        } else {
+            await pool.execute(`DELETE FROM chatbot_user_sessions WHERE phone = ?`, [cleanPhone]);
+        }
+
+        return true;
+    } catch (err) {
+        logger.error('[ChatbotEngine] Error executing chatbot flow engine:', err);
+        return false;
+    }
+}

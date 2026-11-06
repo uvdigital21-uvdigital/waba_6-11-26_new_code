@@ -1,0 +1,531 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// src/controllers/campaignController.js
+// Handles Campaign API endpoints.
+//
+// CHANGES: background campaigns (sendCampaign / sendByTagCampaign) now save
+// components/variables/media to the campaigns row BEFORE sending, and
+// runScheduledCampaignNow loads them back, so a campaign can be RESUMED
+// (only numbers without a campaign_recipients row get messaged).
+// ─────────────────────────────────────────────────────────────────────────────
+
+import { fetchApprovedTemplates, sendCampaignTemplate } from '../services/metaWhatsAppService.js';
+import { hasSufficientCredits } from '../services/creditService.js';
+import logger from '../utils/logger.js';
+import { pool } from '../config/db.js';
+
+// Persist everything needed to resume/re-run a campaign later.
+const savePayload = (campaignId, components, variables, customMediaUrl, customCarouselMedia) =>
+  pool.execute(
+    `UPDATE campaigns SET components_json=?,variables_json=?,custom_media_url=?,carousel_media_json=? WHERE id=?`,
+    [
+      JSON.stringify(components || []),
+      JSON.stringify(variables || {}),
+      customMediaUrl || null,
+      JSON.stringify(customCarouselMedia || null),
+      campaignId
+    ]
+  ).catch(() => {});
+
+/**
+ * GET /api/templates
+ * Fetches approved templates from Meta
+ */
+export const getTemplates = async (req, res, next) => {
+  try {
+    const accountId = req.query.account_id || req.headers['x-account-id'] || null;
+    const organizationId = req.organizationId || req.user?.organization_id || null;
+    const templates = await fetchApprovedTemplates(accountId, organizationId);
+    return res.status(200).json({
+      success: true,
+      data: templates
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * POST /api/campaign/send
+ * Receives campaign data and initiates bulk sending.
+ * Protected against duplicate/double submission via an Idempotency-Key header.
+ */
+export const sendCampaign = async (req, res, next) => {
+  let claimedKey = null;
+
+  try {
+    const { campaignName, template, country, numbers, languageCode: reqLangCode, accountId: bodyAccountId, components, variables, customMediaUrl, customCarouselMedia, background = false } = req.body;
+    const accountId = bodyAccountId || req.headers['x-account-id'] || req.query.account_id || null;
+    const organizationId = req.organizationId || req.user?.organization_id || null;
+    const userId = req.user?.id || 1;
+    const senderName = req.user?.full_name || req.user?.name || req.user?.username || `User #${userId}`;
+    const senderType = req.user?.is_team_member ? 'Team Member' : (req.user?.agent_id ? 'Agent' : 'User');
+
+    // ── Input validation ─────────────────────────────────────────────────
+    if (!campaignName) {
+      return res.status(400).json({ success: false, message: 'Campaign Name is required' });
+    }
+    if (!template) {
+      return res.status(400).json({ success: false, message: 'Template is required' });
+    }
+    if (!numbers || !Array.isArray(numbers) || numbers.length === 0) {
+      return res.status(400).json({ success: false, message: 'At least one phone number is required' });
+    }
+
+    // ── Idempotency guard ────────────────────────────────────────────────
+    // The frontend sends a fresh UUID per submit attempt in the
+    // 'Idempotency-Key' header. We atomically claim it here — if two
+    // requests race in with the SAME key (double-click, network retry),
+    // only the first INSERT succeeds; the second hits a duplicate-key
+    // error and is rejected before any Meta API call or DB campaign row
+    // is created.
+    const idempotencyKey = req.headers['idempotency-key'] || req.body.idempotencyKey || null;
+
+    if (idempotencyKey) {
+      try {
+        await pool.execute(
+          `INSERT INTO campaign_idempotency (idempotency_key, user_id, created_at) VALUES (?, ?, NOW())`,
+          [idempotencyKey, userId]
+        );
+        claimedKey = idempotencyKey;
+      } catch (err) {
+        if (err.code === 'ER_DUP_ENTRY') {
+          logger.warn(`[CampaignController] Blocked duplicate campaign submission for key ${idempotencyKey} (user ${userId}).`);
+          return res.status(409).json({
+            success: false,
+            message: 'This campaign was already submitted. Duplicate request blocked.'
+          });
+        }
+        // If the idempotency table itself fails for some other reason,
+        // log it but don't hard-block sending — fall through and proceed
+        // (fail-open on infra error, fail-closed on actual duplicates).
+        logger.error('[CampaignController] Idempotency check failed unexpectedly:', err);
+      }
+    } else {
+      logger.warn('[CampaignController] Campaign send request received without an Idempotency-Key header — duplicate protection skipped for this request.');
+    }
+
+    const creditCheck = await hasSufficientCredits(userId, numbers.length, req.body.featureKey || 'quick');
+    if (!creditCheck.sufficient) {
+      return res.status(400).json({
+        success: false,
+        message: `Insufficient Quick credits. You have ${creditCheck.available} Quick credit(s) remaining, but this campaign requires ${numbers.length} credit(s). Please contact your administrator.`
+      });
+    }
+
+    logger.info(`[CampaignController] Starting campaign "${campaignName}" with template "${template}" for ${numbers.length} numbers using account ID ${accountId} for org ${organizationId}.`);
+
+    const languageCode = reqLangCode || 'en_US';
+    const featureKey = req.body.featureKey || 'quick';
+
+    if (background === true) {
+      const [queued] = await pool.execute(
+        `INSERT INTO campaigns (user_id, sender_name, sender_type, organization_id, whatsapp_account_id, campaign_name, template_name, language_code, country, total_numbers, sent_count, failed_count, status, scheduled_at, numbers_json, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 'queued', DATE_ADD(NOW(), INTERVAL 2 SECOND), ?, NOW())`,
+        [userId, senderName, senderType, organizationId, accountId, campaignName, template, languageCode, country || null, numbers.length, JSON.stringify(numbers)]
+      );
+      const campaignId = queued.insertId;
+      // Save payload now so the campaign can be resumed later if the server restarts
+      await savePayload(campaignId, components, variables, customMediaUrl, customCarouselMedia);
+      const job = { userId, senderName, senderType, organizationId, accountId, campaignName, templateName: template, languageCode, country, numbers, components, variables, customMediaUrl, customCarouselMedia, featureKey, existingCampaignId: campaignId };
+      setTimeout(async () => {
+        try {
+          const result = await sendCampaignTemplate(job);
+          logger.info(`[CampaignController] Background campaign ${campaignId} "${campaignName}" finished: ${result.sent || 0} sent, ${result.failed || 0} failed.`);
+        } catch (err) {
+          logger.error(`[CampaignController] Background campaign ${campaignId} "${campaignName}" failed:`, err);
+          await pool.execute(`UPDATE campaigns SET status='failed' WHERE id=? AND status IN ('queued','running')`, [campaignId]).catch(() => {});
+          const { emitToOrganization } = await import('../utils/socket.js');
+          emitToOrganization(organizationId || 1, 'sending_history_updated', { type: 'campaign_completed', campaignId, campaignName, sentCount: 0, failedCount: numbers.length, error: err.message });
+        }
+      }, 2000);
+      return res.status(202).json({ success: true, queued: true, campaignId, campaignName, total: numbers.length, message: `Campaign "${campaignName}" queued. Sending will start in 2 seconds.` });
+    }
+
+    const result = await sendCampaignTemplate({
+      userId,
+      senderName,
+      senderType,
+      organizationId,
+      accountId,
+      campaignName,
+      templateName: template,
+      languageCode,
+      country,
+      numbers,
+      components,
+      variables,
+      customMediaUrl,
+      customCarouselMedia,
+      featureKey,
+    });
+
+    return res.status(200).json(result);
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * POST /api/campaign/schedule
+ * Saves a campaign to run at a future date and time.
+ */
+export const scheduleCampaign = async (req, res, next) => {
+  try {
+    const { campaignName, template, country, numbers, scheduledAt, languageCode: reqLangCode, accountId: bodyAccountId } = req.body;
+
+    if (!campaignName) {
+      return res.status(400).json({ success: false, message: 'Campaign Name is required' });
+    }
+    if (!template) {
+      return res.status(400).json({ success: false, message: 'Template is required' });
+    }
+    if (!numbers || !Array.isArray(numbers) || numbers.length === 0) {
+      return res.status(400).json({ success: false, message: 'At least one phone number is required' });
+    }
+
+    const userId = req.user?.id || 1;
+    const senderName = req.user?.full_name || req.user?.name || req.user?.username || `User #${userId}`;
+    const senderType = req.user?.is_team_member ? 'Team Member' : (req.user?.agent_id ? 'Agent' : 'User');
+    const creditCheck = await hasSufficientCredits(userId, numbers.length);
+    if (!creditCheck.sufficient) {
+      return res.status(400).json({
+        success: false,
+        message: `Insufficient credits. You have ${creditCheck.available} credit(s) remaining, but this schedule requires ${numbers.length} credit(s). Please contact your administrator.`
+      });
+    }
+    if (!scheduledAt) {
+      return res.status(400).json({ success: false, message: 'Scheduled date and time is required' });
+    }
+
+    const scheduledDate = new Date(scheduledAt);
+    if (isNaN(scheduledDate.getTime())) {
+      return res.status(400).json({ success: false, message: 'Invalid scheduled date/time format' });
+    }
+
+    const now = new Date();
+    const diffMs = scheduledDate.getTime() - now.getTime();
+    if (diffMs <= 0) {
+      return res.status(400).json({ success: false, message: 'Schedule date must be in the future' });
+    }
+
+    // Format for MySQL DATETIME preserving local time e.g. YYYY-MM-DD HH:mm:ss
+    const pad = (n) => String(n).padStart(2, '0');
+    const formattedMysqlDate = `${scheduledDate.getFullYear()}-${pad(scheduledDate.getMonth() + 1)}-${pad(scheduledDate.getDate())} ${pad(scheduledDate.getHours())}:${pad(scheduledDate.getMinutes())}:${pad(scheduledDate.getSeconds())}`;
+    const languageCode = reqLangCode || 'en_US';
+    const numbersJson = JSON.stringify(numbers);
+    const organizationId = req.organizationId || req.user?.organization_id || null;
+    const accountId = bodyAccountId || req.headers['x-account-id'] || req.query.account_id || null;
+
+    const [result] = await pool.execute(
+      `INSERT INTO campaigns (user_id, sender_name, sender_type, organization_id, whatsapp_account_id, campaign_name, template_name, language_code, country, total_numbers, status, scheduled_at, numbers_json)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'scheduled', ?, ?)`,
+      [userId, senderName, senderType, organizationId || null, accountId || null, campaignName, template, languageCode, country || null, numbers.length, formattedMysqlDate, numbersJson]
+    );
+
+    // Calculate human readable diff
+    const totalMinutes = Math.floor(diffMs / (1000 * 60));
+    const hours = Math.floor(totalMinutes / 60);
+    const minutes = totalMinutes % 60;
+    const timeRemainingStr = hours > 0 ? `${hours} hr ${minutes} min` : `${minutes} min`;
+
+    logger.info(`[CampaignController] Scheduled campaign ID ${result.insertId} "${campaignName}" for ${formattedMysqlDate} (${timeRemainingStr} from now).`);
+
+    return res.status(200).json({
+      success: true,
+      message: `Campaign scheduled successfully! Messages will be sent in ${timeRemainingStr}.`,
+      campaignId: result.insertId,
+      scheduledAt: formattedMysqlDate,
+      timeRemaining: timeRemainingStr,
+      totalNumbers: numbers.length
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * GET /api/campaign/scheduled
+ * Fetches all persistent scheduled campaigns from MySQL database.
+ */
+export const getScheduledCampaigns = async (req, res, next) => {
+  try {
+    const organizationId = req.organizationId || req.user?.organization_id || 1;
+    const showAll = req.query.all === 'true';
+    const query = showAll
+      ? `SELECT id, campaign_name, template_name, language_code, country, total_numbers, sent_count, failed_count, status, scheduled_at, created_at 
+         FROM campaigns 
+         WHERE scheduled_at IS NOT NULL 
+           AND (organization_id = ? OR organization_id IS NULL)
+         ORDER BY scheduled_at DESC`
+      : `SELECT id, campaign_name, template_name, language_code, country, total_numbers, sent_count, failed_count, status, scheduled_at, created_at 
+         FROM campaigns 
+         WHERE status IN ('scheduled', 'running') 
+           AND scheduled_at IS NOT NULL 
+           AND (organization_id = ? OR organization_id IS NULL)
+         ORDER BY scheduled_at ASC`;
+
+    const [rows] = await pool.execute(query, [organizationId]);
+    return res.status(200).json({
+      success: true,
+      data: rows
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * DELETE /api/campaign/scheduled/:id
+ * Cancels an upcoming scheduled campaign or deletes a completed/failed log.
+ * SAFETY: a RUNNING campaign is never deleted (that used to wipe its history).
+ */
+export const cancelScheduledCampaign = async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const organizationId = req.organizationId || req.user?.organization_id || 1;
+
+    const [rows] = await pool.execute(
+      `SELECT id, status FROM campaigns WHERE id = ? AND (organization_id = ? OR organization_id IS NULL)`,
+      [id, organizationId]
+    );
+
+    if (rows.length === 0) {
+      return res.status(404).json({ success: false, message: 'Scheduled campaign log not found' });
+    }
+
+    const item = rows[0];
+    if (item.status === 'scheduled') {
+      await pool.execute(
+        `UPDATE campaigns SET status = 'cancelled' WHERE id = ?`,
+        [id]
+      );
+      logger.info(`[CampaignController] Cancelled scheduled campaign ID ${id}.`);
+      return res.status(200).json({
+        success: true,
+        message: 'Scheduled campaign cancelled successfully'
+      });
+    } else if (item.status === 'running' || item.status === 'queued') {
+      // Mark as interrupted instead of deleting so history/recipients are kept
+      await pool.execute(
+        `UPDATE campaigns SET status = 'interrupted' WHERE id = ?`,
+        [id]
+      );
+      logger.info(`[CampaignController] Marked running campaign ID ${id} as interrupted (not deleted).`);
+      return res.status(200).json({
+        success: true,
+        message: 'Campaign marked as interrupted. History kept.'
+      });
+    } else {
+      await pool.execute(
+        `DELETE FROM campaigns WHERE id = ?`,
+        [id]
+      );
+      logger.info(`[CampaignController] Deleted campaign log ID ${id}.`);
+      return res.status(200).json({
+        success: true,
+        message: 'Scheduled log entry removed successfully'
+      });
+    }
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * POST /api/campaign/scheduled/:id/run-now
+ * Manually trigger execution of a scheduled campaign immediately.
+ * Also acts as RESUME: numbers that already have a campaign_recipients row
+ * are skipped, only the remaining numbers get the message.
+ */
+export const runScheduledCampaignNow = async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const organizationId = req.organizationId || req.user?.organization_id || 1;
+
+    const [rows] = await pool.execute(
+      `SELECT * FROM campaigns WHERE id = ? AND (organization_id = ? OR organization_id IS NULL)`,
+      [id, organizationId]
+    );
+
+    if (rows.length === 0) {
+      return res.status(404).json({ success: false, message: 'Campaign log not found' });
+    }
+
+    const campaign = rows[0];
+    let numbers = [];
+    if (campaign.numbers_json) {
+      try {
+        numbers = typeof campaign.numbers_json === 'string' ? JSON.parse(campaign.numbers_json) : campaign.numbers_json;
+      } catch (e) { }
+    }
+
+    if (!numbers || !Array.isArray(numbers) || numbers.length === 0) {
+      try {
+        const [crRows] = await pool.execute(
+          `SELECT DISTINCT phone FROM campaign_recipients WHERE campaign_id = ?`,
+          [campaign.id]
+        );
+        numbers = crRows.map(r => r.phone).filter(Boolean);
+      } catch (e) { }
+    }
+
+    if (!numbers || numbers.length === 0) {
+      return res.status(400).json({ success: false, message: 'No recipient numbers found for this campaign.' });
+    }
+
+    // Load the saved payload so a resume sends the SAME message (variables/media)
+    let savedComponents = [];
+    try { if (campaign.components_json) savedComponents = JSON.parse(campaign.components_json); } catch (_) { }
+    let savedVariables = {};
+    try { if (campaign.variables_json) savedVariables = JSON.parse(campaign.variables_json); } catch (_) { }
+    let savedCarouselMedia = null;
+    try { if (campaign.carousel_media_json) savedCarouselMedia = JSON.parse(campaign.carousel_media_json); } catch (_) { }
+
+    logger.info(`[CampaignController] Triggering manual run/resume for campaign ID ${id} (${numbers.length} numbers)...`);
+
+    const result = await sendCampaignTemplate({
+      userId: req.user?.id || campaign.user_id || 1,
+      senderName: campaign.sender_name || null,
+      senderType: campaign.sender_type || 'User',
+      organizationId,
+      accountId: campaign.whatsapp_account_id,
+      campaignName: campaign.campaign_name,
+      templateName: campaign.template_name,
+      languageCode: campaign.language_code || 'en_US',
+      country: campaign.country,
+      numbers,
+      components: savedComponents,
+      variables: savedVariables,
+      customMediaUrl: campaign.custom_media_url || null,
+      customCarouselMedia: savedCarouselMedia,
+      existingCampaignId: campaign.id,
+      featureKey: 'quick'
+    });
+
+    if (!result.success) {
+      const errorDetail = result.results?.find(r => !r.success)?.error || result.message || 'Execution failed';
+      return res.status(400).json({
+        success: false,
+        message: `Campaign execution failed: ${errorDetail}`,
+        result
+      });
+    }
+
+    return res.status(200).json({
+      success: true,
+      message: `Campaign executed! Sent: ${result.sent}, Failed: ${result.failed}`,
+      result
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * POST /api/campaign/send-by-tag
+ * Fetch all contacts for a specific tag and send a template to them.
+ */
+export const sendByTagCampaign = async (req, res, next) => {
+  try {
+    const { campaignName, template, country, tagId, languageCode: reqLangCode, components, variables, customMediaUrl, customCarouselMedia, background = false } = req.body;
+
+    if (!campaignName) return res.status(400).json({ success: false, message: 'Campaign Name is required' });
+    if (!template) return res.status(400).json({ success: false, message: 'Template is required' });
+    if (!tagId) return res.status(400).json({ success: false, message: 'Tag ID is required' });
+
+    const [chatRows] = await pool.execute(
+      `SELECT COALESCE(c.contact_phone, ct.chat_id) AS phoneNumber
+       FROM chat_tags ct
+       LEFT JOIN conversations c ON (c.id = ct.chat_id OR c.contact_phone = ct.chat_id)
+       WHERE ct.tag_id = ?
+         AND TRIM(COALESCE(c.contact_phone, ct.chat_id, '')) <> ''`,
+      [tagId]
+    );
+
+    const [contactRows] = await pool.execute(
+      `SELECT ct.phone AS phoneNumber
+       FROM contact_tags ct
+       WHERE ct.tag_id = ?
+         AND TRIM(COALESCE(ct.phone, '')) <> ''`,
+      [tagId]
+    );
+
+    const numbers = [...new Set([
+      ...chatRows.map((row) => String(row.phoneNumber || '').trim()),
+      ...contactRows.map((row) => String(row.phoneNumber || '').trim()),
+    ].filter(Boolean))]
+      .map((phone) => phone.replace(/^[+]/, '').replace(/[^0-9]/g, ''))
+      .filter((phone) => phone.length >= 7 && phone.length <= 15);
+
+    if (numbers.length === 0) {
+      return res.status(400).json({ success: false, message: 'No contacts are assigned to this tag.' });
+    }
+
+    const userId = req.user?.id || 1;
+    const senderName = req.user?.full_name || req.user?.name || req.user?.username || `User #${userId}`;
+    const senderType = req.user?.is_team_member ? 'Team Member' : (req.user?.agent_id ? 'Agent' : 'User');
+    const creditCheck = await hasSufficientCredits(userId, numbers.length, 'tags');
+    if (!creditCheck.sufficient) {
+      return res.status(400).json({
+        success: false,
+        message: `Insufficient Tag credits. You have ${creditCheck.available} Tag credit(s) remaining, but this campaign requires ${numbers.length} credit(s). Please contact your administrator.`
+      });
+    }
+
+    logger.info(`[CampaignController] Starting campaign by tag "${campaignName}" with template "${template}" for ${numbers.length} numbers.`);
+
+    const languageCode = reqLangCode || 'en_US';
+    const accountId = req.body.accountId || req.headers['x-account-id'] || req.query.account_id || null;
+    const organizationId = req.organizationId || req.user?.organization_id || null;
+
+    if (background === true) {
+      const [queued] = await pool.execute(
+        `INSERT INTO campaigns (user_id,sender_name,sender_type,organization_id,whatsapp_account_id,campaign_name,template_name,language_code,country,total_numbers,sent_count,failed_count,status,scheduled_at,numbers_json,created_at)
+         VALUES (?,?,?,?,?,?,?,?,?,?,0,0,'queued',DATE_ADD(NOW(),INTERVAL 2 SECOND),?,NOW())`,
+        [userId, senderName, senderType, organizationId, accountId, campaignName, template, languageCode, country || null, numbers.length, JSON.stringify(numbers)]
+      );
+      const campaignId = queued.insertId;
+      // Save payload now so the campaign can be resumed later if the server restarts
+      await savePayload(campaignId, components, variables, customMediaUrl, customCarouselMedia);
+      setTimeout(async () => {
+        try {
+          await sendCampaignTemplate({ userId, senderName, senderType, organizationId, accountId, campaignName, templateName: template, languageCode, country: country || null, numbers, components, variables, customMediaUrl, customCarouselMedia, featureKey: 'tags', existingCampaignId: campaignId });
+        } catch (err) {
+          logger.error(`[CampaignController] Background tag campaign ${campaignId} failed:`, err);
+          await pool.execute(`UPDATE campaigns SET status='failed' WHERE id=? AND status IN ('queued','running')`, [campaignId]).catch(() => {});
+          const { emitToOrganization } = await import('../utils/socket.js');
+          emitToOrganization(organizationId || 1, 'sending_history_updated', { type: 'campaign_completed', campaignId, campaignName, sentCount: 0, failedCount: numbers.length, error: err.message });
+        }
+      }, 2000);
+      return res.status(202).json({ success: true, queued: true, campaignId, campaignName, total: numbers.length, message: `Campaign "${campaignName}" queued. Sending starts in 2 seconds.` });
+    }
+
+    const result = await sendCampaignTemplate({
+      userId: req.user?.id || 1,
+      senderName,
+      senderType,
+      organizationId,
+      accountId,
+      campaignName,
+      templateName: template,
+      languageCode,
+      country: country || null,
+      numbers,
+      components,
+      variables,
+      customMediaUrl,
+      customCarouselMedia,
+      featureKey: 'tags',
+    });
+
+    return res.status(200).json({
+      ...result,
+      success: true,
+      total: result.total || numbers.length,
+      sent: result.sent || 0,
+      failed: result.failed || 0,
+    });
+  } catch (error) {
+    next(error);
+  }
+};

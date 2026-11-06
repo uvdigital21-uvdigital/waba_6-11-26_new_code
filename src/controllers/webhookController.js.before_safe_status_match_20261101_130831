@@ -1,0 +1,614 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// src/controllers/webhookController.js
+// Handles GET and POST requests to /webhook for incoming WhatsApp messages and status updates.
+//
+// CHATBOT FIX: incoming messages are now routed to processIncomingChatbotMessage()
+// (services/chatbotEngineService.js) with accountId / organizationId so that:
+//   - list / button replies resume the flow from the saved session
+//   - every connected node of the flow is executed
+//   - each client's flow uses its own WhatsApp account
+// Set CHATBOT_ENGINE=legacy in .env to fall back to the old FlowExecutor.
+// ─────────────────────────────────────────────────────────────────────────────
+
+import whatsappConfig from '../config/whatsapp.js';
+import logger from '../utils/logger.js';
+import saveWebhook from '../utils/saveWebhook.js';
+import { pool } from '../config/db.js';
+import { recordChatMessage } from '../services/chatService.js';
+import { emitToOrganization, emitSocketEvent } from '../utils/socket.js';
+import { FlowExecutor } from '../services/FlowExecutor.js';
+import { processIncomingChatbotMessage } from '../services/chatbotEngineService.js';
+import { updateActivityStatus } from '../services/agentActivityLogger.js';
+import { checkBlacklist } from '../services/blacklistService.js';
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Helper function to extract incoming message objects from any WhatsApp webhook format
+// ─────────────────────────────────────────────────────────────────────────────
+function extractMessagesFromPayload(body) {
+  const extracted = [];
+
+  if (!body) return extracted;
+
+  // 1. Meta WhatsApp Cloud API format
+  if (body.object === 'whatsapp_business_account' || Array.isArray(body.entry)) {
+    const entries = body.entry ?? [];
+    for (const entry of entries) {
+      const changes = entry.changes ?? [];
+      for (const change of changes) {
+        const value = change.value ?? {};
+        const instanceId = value.metadata?.phone_number_id || process.env.PHONE_NUMBER_ID || whatsappConfig.phoneNumberId || 'default';
+        const contacts = value.contacts ?? [];
+        const contactProfileName = contacts?.[0]?.profile?.name || null;
+        const messages = value.messages ?? [];
+
+        for (const msg of messages) {
+          const from = msg.from;
+          const type = msg.type || 'text';
+          let textBody = '';
+          let buttonPayload = null;
+          let listPayload = null;
+          let locationPayload = null;
+          let mediaId = null;
+          let mediaUrl = null;
+          const contextId = msg.context?.id || null;
+
+          if (type === 'text') {
+            textBody = msg.text?.body || '';
+          } else if (type === 'image') {
+            mediaId = msg.image?.id || null;
+            textBody = msg.image?.caption || '[📷 Image message]';
+          } else if (type === 'document') {
+            mediaId = msg.document?.id || null;
+            textBody = msg.document?.filename || '[📄 Document message]';
+          } else if (type === 'audio' || type === 'voice') {
+            mediaId = msg.audio?.id || msg.voice?.id || null;
+            textBody = '[🎵 Audio message]';
+          } else if (type === 'video') {
+            mediaId = msg.video?.id || null;
+            textBody = msg.video?.caption || '[🎥 Video message]';
+          } else if (type === 'button') {
+            textBody = msg.button?.text || msg.button?.payload || '[Button Response]';
+            buttonPayload = msg.button?.payload || msg.button?.text || null;
+          } else if (type === 'interactive') {
+            const iObj = msg.interactive || {};
+            if (iObj.type === 'button_reply' || iObj.button_reply) {
+              textBody = iObj.button_reply?.title || iObj.button_reply?.id || '[Button Reply]';
+              buttonPayload = iObj.button_reply?.id || iObj.button_reply?.title || null;
+            } else if (iObj.type === 'list_reply' || iObj.list_reply) {
+              textBody = iObj.list_reply?.title || iObj.list_reply?.id || '[List Reply]';
+              buttonPayload = iObj.list_reply?.id || iObj.list_reply?.title || null;
+              listPayload = iObj.list_reply?.id || iObj.list_reply?.title || null;
+            } else {
+              textBody = '[Interactive Response]';
+              buttonPayload = iObj.id || null;
+            }
+          } else if (type === 'location') {
+            textBody = '[📍 Location message]';
+            locationPayload = msg.location || null;
+          } else if (type === 'sticker') {
+            mediaId = msg.sticker?.id || null;
+            textBody = '[🏷️ Sticker message]';
+          } else if (type === 'reaction') {
+            textBody = msg.reaction?.emoji || '[Reaction]';
+          } else {
+            textBody = msg.body || msg.text || `[${type} message]`;
+          }
+
+          extracted.push({
+            from,
+            textBody: String(textBody).trim(),
+            buttonPayload,
+            listPayload,
+            locationPayload,
+            mediaId,
+            mediaUrl,
+            contextId,
+            wamid: msg.id,
+            type,
+            instanceId,
+            contactName: contactProfileName,
+            timestamp: msg.timestamp,
+            rawPayload: msg,
+          });
+        }
+      }
+    }
+    return extracted;
+  }
+
+  // 2. Event-driven provider format
+  const eventName = (body.event || body.type || body.action || '').toLowerCase();
+  const isMessageEvent = eventName.includes('message') || eventName.includes('upsert') || eventName.includes('receive');
+
+  if (isMessageEvent || body.data || body.payload || body.message || body.messages) {
+    const dataObj = body.data || body.payload || body.messages || body.message || body;
+    const items = Array.isArray(dataObj) ? dataObj : [dataObj];
+
+    for (const item of items) {
+      if (!item || typeof item !== 'object') continue;
+
+      const rawFrom = item.from || item.phone || item.phone_number || item.remoteJid || item.key?.remoteJid;
+      if (!rawFrom) continue;
+      if (item.fromMe === true || item.key?.fromMe === true) continue;
+
+      const cleanPhone = String(rawFrom).replace(/@.*$/, '').replace(/\D/g, '');
+      if (!cleanPhone) continue;
+
+      let textBody = item.text || item.message || item.body || item.conversation || item.caption || item.message?.conversation || item.message?.extendedTextMessage?.text || item.message?.text || '';
+      if (typeof textBody === 'object') {
+        textBody = textBody.conversation || textBody.text || textBody.body || JSON.stringify(textBody);
+      }
+      if (!textBody) textBody = '[Incoming message]';
+
+      const wamid = item.wamid || item.id || item.message_id || item.key?.id || `wamid.msg_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`;
+      const instanceId = item.instanceId || item.instance_id || item.sessionId || body.instance || process.env.PHONE_NUMBER_ID || 'default';
+      const contactName = item.contactName || item.pushName || item.name || null;
+
+      extracted.push({
+        from: cleanPhone,
+        textBody: String(textBody),
+        wamid,
+        type: item.type || 'text',
+        instanceId,
+        contactName,
+        timestamp: item.timestamp || item.messageTimestamp || Date.now(),
+        rawPayload: item,
+      });
+    }
+  }
+
+  // 3. Direct/flat payload fallback
+  if (extracted.length === 0 && (body.from || body.phone || body.phone_number) && (body.message || body.text || body.body)) {
+    const rawFrom = body.from || body.phone || body.phone_number;
+    const cleanPhone = String(rawFrom).replace(/\D/g, '');
+    const textBody = body.message || body.text || body.body;
+    const instanceId = body.instanceId || body.instance_id || body.phone_number_id || process.env.PHONE_NUMBER_ID || 'default';
+    const wamid = body.wamid || body.message_id || body.id || `wamid.msg_${Date.now()}`;
+
+    if (cleanPhone && textBody) {
+      extracted.push({
+        from: cleanPhone,
+        textBody: String(textBody),
+        wamid,
+        type: body.type || 'text',
+        instanceId,
+        contactName: body.contactName || body.name || null,
+        timestamp: body.timestamp || Date.now(),
+        rawPayload: body,
+      });
+    }
+  }
+
+  return extracted;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /webhook  —  Webhook Verification
+// ─────────────────────────────────────────────────────────────────────────────
+export const verifyWebhook = async (req, res) => {
+  try {
+    console.log("========== [WEBHOOK VERIFICATION] GET /webhook ==========");
+    const mode = req.query['hub.mode'] || req.query['mode'];
+    const token = req.query['hub.verify_token'] || req.query['verify_token'];
+    const challenge = req.query['hub.challenge'] || req.query['challenge'];
+
+    console.log(`[Webhook Verification] Params received: mode="${mode}", verify_token="${token}", challenge="${challenge}"`);
+
+    if (mode !== 'subscribe') {
+      logger.warn('[Webhook] Verification failed: hub.mode is not "subscribe"');
+      return res.status(403).send('Forbidden');
+    }
+
+    // Standard set of valid verify tokens
+    const validTokens = new Set([
+      'my_super_secret_verify_token_2024',
+      process.env.WHATSAPP_VERIFY_TOKEN,
+      process.env.WEBHOOK_VERIFY_TOKEN,
+      process.env.VERIFY_TOKEN,
+      whatsappConfig.verifyToken
+    ].filter(Boolean));
+
+    // Also check database for any multi-tenant configured tokens
+    try {
+      const [dbTokens] = await pool.query(`SELECT verify_token FROM webhook_configurations WHERE verify_token IS NOT NULL AND verify_token != ''`);
+      dbTokens.forEach(row => {
+        if (row.verify_token) validTokens.add(row.verify_token);
+      });
+    } catch (e) { /* ignore if table missing */ }
+
+    if (!token || !validTokens.has(token)) {
+      logger.warn(`[Webhook] Verification failed: token mismatch. Received "${token}"`);
+      return res.status(403).send('Forbidden');
+    }
+
+    logger.info(`[Webhook] Verification succeeded for challenge "${challenge}". Returning plain text 200 OK.`);
+
+    // Return the exact challenge as plain text with HTTP 200
+    return res.type('text/plain').status(200).send(String(challenge));
+  } catch (err) {
+    console.error("[WEBHOOK ERROR] GET /webhook EXCEPTION:", err.message);
+    return res.status(500).send('Internal Server Error');
+  }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /webhook  —  Receive Incoming Messages & Status Events
+// ─────────────────────────────────────────────────────────────────────────────
+export const receiveWebhook = (req, res) => {
+  const expressArrivalMs = Date.now();
+  const body = req.body || {};
+
+  console.log(`\n==================== [REAL WA WEBHOOK] RECEIVED ====================`);
+  console.log(`received_at=${new Date(expressArrivalMs).toISOString()}`);
+  console.log(`method=${req.method}`);
+  console.log(`path=${req.originalUrl || req.url}`);
+  console.log(`raw_payload_snippet=${JSON.stringify(body).substring(0, 200)}`);
+  console.log(`====================================================================\n`);
+
+  try {
+    // Immediately respond with HTTP 200 OK so Meta/ngrok never times out
+    res.status(200).send('EVENT_RECEIVED');
+  } catch (expressErr) {
+    if (!res.headersSent) {
+      res.status(200).send('EVENT_RECEIVED');
+    }
+    return;
+  }
+
+  // Process payload asynchronously in background
+  setImmediate(async () => {
+    try {
+      const incomingMessages = extractMessagesFromPayload(body);
+
+      for (const incoming of incomingMessages) {
+        console.log("------------------------------------------------------------");
+        console.log(`[WHATSAPP INBOUND] Processing Message from ${incoming.from} (Type: ${incoming.type}, WAMID: ${incoming.wamid})`);
+
+        // Blacklist Check
+        const isSenderBlocked = await checkBlacklist(incoming.from);
+        if (isSenderBlocked) {
+          logger.warn(`[BLACKLIST] Blocked incoming message from blacklisted number: ${incoming.from}.`);
+          continue;
+        }
+
+        // Save raw webhook to disk
+        try {
+          saveWebhook(body);
+        } catch (_) { }
+
+        const metaTimestampSec = Number(incoming.timestamp) || Math.floor(expressArrivalMs / 1000);
+
+        // STEP 5: AUTHORITATIVE TENANT RESOLUTION USING PHONE_NUMBER_ID
+        let incomingUserId = 1;
+        let incomingOrgId = null;
+        let incomingAccountId = null;
+
+        const phoneNumId = incoming.instanceId && incoming.instanceId !== 'default' ? incoming.instanceId : null;
+        console.log(`[2] PHONE NUMBER ID RESOLVED: ${phoneNumId || 'None'}`);
+
+        if (phoneNumId) {
+          try {
+            const [accRows] = await pool.query(
+              'SELECT id, organization_id, user_id FROM whatsapp_accounts WHERE phone_number_id = ? OR phone_number = ? OR RIGHT(REGEXP_REPLACE(phone_number, "[^0-9]", ""), 10) = ? LIMIT 1',
+              [phoneNumId, phoneNumId, phoneNumId.slice(-10)]
+            );
+            if (accRows.length > 0) {
+              incomingAccountId = accRows[0].id;
+              incomingOrgId = accRows[0].organization_id;
+              incomingUserId = accRows[0].user_id || 1;
+            }
+          } catch (orgLookupErr) {
+            console.error('[WEBHOOK AUDIT] Error looking up org for incoming message:', orgLookupErr.message);
+          }
+        }
+
+        console.log(`[3] ORGANIZATION RESOLVED: org_id=${incomingOrgId || 'Unassigned'}, account_id=${incomingAccountId || 'Unassigned'}`);
+
+        if (!incomingOrgId) {
+          logger.warn(`[WEBHOOK AUDIT] Unrecognized receiving phone_number_id "${incoming.instanceId}". Message ignored or saved as unassigned.`);
+        }
+
+        // STEP 8: CAMPAIGN MATCH LOOKUP
+        let campaignId = null;
+        if (incomingOrgId) {
+          try {
+            if (incoming.contextId) {
+              const [cRows] = await pool.query(
+                'SELECT campaign_id FROM campaign_recipients WHERE message_id = ? AND organization_id = ? LIMIT 1',
+                [incoming.contextId, incomingOrgId]
+              );
+              if (cRows.length > 0) campaignId = cRows[0].campaign_id;
+            }
+            if (!campaignId) {
+              const [cRows] = await pool.query(
+                'SELECT campaign_id FROM campaign_recipients WHERE (phone = ? OR RIGHT(REGEXP_REPLACE(phone, "[^0-9]", ""), 10) = ?) AND organization_id = ? ORDER BY id DESC LIMIT 1',
+                [incoming.from, incoming.from.slice(-10), incomingOrgId]
+              );
+              if (cRows.length > 0) campaignId = cRows[0].campaign_id;
+            }
+          } catch (campErr) {
+            logger.warn(`[WEBHOOK AUDIT] Error finding associated campaign:`, campErr.message);
+          }
+        }
+
+        const traceId = `trace_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+        console.log(`[WA TRACE START] traceId=${traceId} wamid=${incoming.wamid} phone_number_id=${incoming.instanceId} wa_id=${incoming.from}`);
+
+        // RECORD INBOUND MESSAGE
+        await recordChatMessage({
+          traceId,
+          userId: incomingUserId,
+          organizationId: incomingOrgId,
+          whatsappAccountId: incomingAccountId,
+          campaignId,
+          phone: incoming.from,
+          messageText: incoming.textBody,
+          wamid: incoming.wamid,
+          sender: 'contact',
+          direction: 'incoming',
+          messageType: incoming.type,
+          mediaId: incoming.mediaId,
+          mediaUrl: incoming.mediaUrl,
+          rawPayload: incoming.rawPayload,
+          status: 'read',
+          sessionId: incoming.instanceId,
+          instanceId: incoming.instanceId,
+          contactName: incoming.contactName,
+        }).catch(err => {
+          console.error('[WEBHOOK AUDIT] Error recording chat message to DB:', err.message);
+        });
+
+        // ─────────────────────────────────────────────────────────────────
+        // Trigger Chatbot Flow Engine
+        // Default: chatbotEngineService (full flow execution + list/button resume)
+        // Fallback: set CHATBOT_ENGINE=legacy in .env to use old FlowExecutor
+        // ─────────────────────────────────────────────────────────────────
+        if (incoming.type === 'reaction') {
+          // Emoji reactions must never trigger / advance a chatbot flow
+          continue;
+        }
+
+        const useLegacyEngine = String(process.env.CHATBOT_ENGINE || '').toLowerCase() === 'legacy';
+
+        if (useLegacyEngine) {
+          await FlowExecutor.execute({
+            wamid: incoming.wamid,
+            phone: incoming.from,
+            inputStr: incoming.textBody,
+            buttonPayload: incoming.buttonPayload || null,
+            listPayload: incoming.listPayload || null,
+            locationPayload: incoming.locationPayload || null,
+            organizationId: incomingOrgId,
+            whatsappAccountId: incomingAccountId,
+            expressArrivalMs,
+            metaTimestampSec
+          }).catch(err => {
+            console.error('[CHATBOT EXECUTION ERROR] FlowExecutor Exception:', err.message);
+          });
+        } else {
+          await processIncomingChatbotMessage({
+            phone: incoming.from,
+            messageText: incoming.textBody,
+            buttonPayload: incoming.buttonPayload || null,
+            listPayload: incoming.listPayload || null,
+            locationPayload: incoming.locationPayload || null,
+            accountId: incomingAccountId,
+            organizationId: incomingOrgId,
+            contactName: incoming.contactName || null
+          }).catch(err => {
+            console.error('[CHATBOT EXECUTION ERROR] chatbotEngineService Exception:', err.message);
+          });
+        }
+      }
+
+      // 2. Handle Message Status Updates (sent, delivered, read, failed)
+      if (body.object === 'whatsapp_business_account' || Array.isArray(body.entry)) {
+        for (const entry of body.entry ?? []) {
+          for (const change of entry.changes ?? []) {
+            const value = change.value ?? {};
+            const statuses = value.statuses ?? [];
+            const phoneNumId = value.metadata?.phone_number_id || null;
+
+            let orgId = null;
+            if (phoneNumId) {
+              const [accs] = await pool.query('SELECT organization_id FROM whatsapp_accounts WHERE phone_number_id = ? LIMIT 1', [phoneNumId]).catch(() => [[]]);
+              if (accs.length > 0) orgId = accs[0].organization_id;
+            }
+
+            for (const statusObj of statuses) {
+              // Declare every result variable up front for THIS iteration.
+              let recipRes = { affectedRows: 0 };
+              let recipPhoneRes = { affectedRows: 0 };
+              let msgRes = { affectedRows: 0 };
+              let formattedError = null;
+
+              const rawWamid = String(statusObj.id || '').trim();
+              const cleanWamid = rawWamid.replace(/^wamid\./i, '');
+              const prefixedWamid = rawWamid.startsWith('wamid.') ? rawWamid : `wamid.${rawWamid}`;
+              const msgStatus = (statusObj.status || '').toLowerCase();
+              const recipientPhone = statusObj.recipient_id ? String(statusObj.recipient_id).replace(/\D/g, '') : '';
+
+              if (msgStatus === 'failed') {
+                const errorCode = statusObj.errors?.[0]?.code || '';
+                const errorMsg = statusObj.errors?.[0]?.message || statusObj.errors?.[0]?.title || 'Message failed delivery';
+                formattedError = errorCode ? `Meta Error ${errorCode}: ${errorMsg}` : errorMsg;
+                logger.error(`[Webhook Status] Delivery failed for ${rawWamid}. Code ${errorCode}: ${errorMsg}`);
+
+                // Update campaign_recipients with failure status and error reason
+                [recipRes] = await pool.query(
+                  `UPDATE campaign_recipients SET status = 'failed', error = ? WHERE message_id = ? OR message_id = ? OR message_id = ?`,
+                  [formattedError, rawWamid, cleanWamid, prefixedWamid]
+                ).catch((e) => {
+                  logger.warn(`[Webhook Status] campaign_recipients failed update error:`, e.message);
+                  return [{ affectedRows: 0 }];
+                });
+
+                // Update campaign failed counts
+                await pool.query(
+                  `UPDATE campaigns c 
+                   SET c.failed_count = (SELECT COUNT(*) FROM campaign_recipients WHERE campaign_id = c.id AND LOWER(status) = 'failed')
+                   WHERE c.id IN (SELECT DISTINCT campaign_id FROM campaign_recipients WHERE message_id = ? OR message_id = ? OR message_id = ?)`,
+                  [rawWamid, cleanWamid, prefixedWamid]
+                ).catch(() => { });
+
+                // Reflect failure and exact error reason on the messages table
+                try {
+                  [msgRes] = await pool.query(
+                    `UPDATE messages SET status = 'failed', error = ? WHERE wa_message_id = ? OR wa_message_id = ? OR wa_message_id = ?`,
+                    [formattedError, rawWamid, cleanWamid, prefixedWamid]
+                  );
+                } catch (_) {
+                  [msgRes] = await pool.query(
+                    `UPDATE messages SET status = 'failed' WHERE wa_message_id = ? OR wa_message_id = ? OR wa_message_id = ?`,
+                    [rawWamid, cleanWamid, prefixedWamid]
+                  ).catch((e) => {
+                    logger.warn(`[Webhook Status] messages failed update error:`, e.message);
+                    return [{ affectedRows: 0 }];
+                  });
+                }
+              } else if (msgStatus === 'delivered') {
+                [recipRes] = await pool.query(
+                  `UPDATE campaign_recipients
+                   SET status = CASE WHEN LOWER(status) = 'read' THEN status ELSE ? END,
+                       delivered_at = COALESCE(delivered_at, NOW())
+                   WHERE message_id = ? OR message_id = ? OR message_id = ?`,
+                  [msgStatus, rawWamid, cleanWamid, prefixedWamid]
+                ).catch((e) => {
+                  logger.warn(`[Webhook Status] campaign_recipients delivered error:`, e.message);
+                  return [{ affectedRows: 0 }];
+                });
+
+                [msgRes] = await pool.query(
+                  `UPDATE messages
+                   SET status = CASE WHEN LOWER(status) = 'read' THEN status ELSE 'delivered' END
+                   WHERE wa_message_id = ? OR wa_message_id = ? OR wa_message_id = ?`,
+                  [rawWamid, cleanWamid, prefixedWamid]
+                ).catch((e) => {
+                  logger.warn(`[Webhook Status] messages delivered update error:`, e.message);
+                  return [{ affectedRows: 0 }];
+                });
+              } else if (msgStatus === 'read') {
+                [recipRes] = await pool.query(
+                  `UPDATE campaign_recipients SET status = ?, read_at = COALESCE(read_at, NOW()) WHERE message_id = ? OR message_id = ? OR message_id = ?`,
+                  [msgStatus, rawWamid, cleanWamid, prefixedWamid]
+                ).catch((e) => {
+                  logger.warn(`[Webhook Status] campaign_recipients read error:`, e.message);
+                  return [{ affectedRows: 0 }];
+                });
+
+                // Update aggregated campaigns read_count
+                await pool.query(
+                  `UPDATE campaigns c 
+                   SET c.read_count = (SELECT COUNT(*) FROM campaign_recipients WHERE campaign_id = c.id AND (LOWER(status) = 'read' OR read_at IS NOT NULL))
+                   WHERE c.id IN (SELECT DISTINCT campaign_id FROM campaign_recipients WHERE message_id = ? OR message_id = ? OR message_id = ?)`,
+                  [rawWamid, cleanWamid, prefixedWamid]
+                ).catch(() => { });
+
+                // Update message_logs
+                await pool.query(
+                  `UPDATE message_logs SET status = 'read' WHERE message_id = ? OR message_id = ? OR message_id = ? OR (recipient = ? AND created_at >= NOW() - INTERVAL 1 DAY)`,
+                  [rawWamid, cleanWamid, prefixedWamid, recipientPhone]
+                ).catch(() => { });
+
+                [msgRes] = await pool.query(
+                  `UPDATE messages SET status = 'read' WHERE wa_message_id = ? OR wa_message_id = ? OR wa_message_id = ?`,
+                  [rawWamid, cleanWamid, prefixedWamid]
+                ).catch((e) => {
+                  logger.warn(`[Webhook Status] messages read update error:`, e.message);
+                  return [{ affectedRows: 0 }];
+                });
+              } else {
+                [recipRes] = await pool.query(
+                  `UPDATE campaign_recipients
+                   SET status = CASE
+                     WHEN ? = 'sent' AND LOWER(status) IN ('delivered', 'read') THEN status
+                     ELSE ?
+                   END
+                   WHERE message_id = ? OR message_id = ? OR message_id = ?`,
+                  [msgStatus, msgStatus, rawWamid, cleanWamid, prefixedWamid]
+                ).catch((e) => {
+                  return [{ affectedRows: 0 }];
+                });
+
+                [msgRes] = await pool.query(
+                  `UPDATE messages
+                   SET status = CASE
+                     WHEN ? = 'sent' AND LOWER(status) IN ('delivered', 'read') THEN status
+                     ELSE ?
+                   END
+                   WHERE wa_message_id = ? OR wa_message_id = ? OR wa_message_id = ?`,
+                  [msgStatus, msgStatus, rawWamid, cleanWamid, prefixedWamid]
+                ).catch((e) => {
+                  return [{ affectedRows: 0 }];
+                });
+              }
+
+              // Fallback recipient update by phone if direct message_id match was 0
+              if ((!recipRes || recipRes.affectedRows === 0) && recipientPhone) {
+                try {
+                  let setClause = 'status = ?';
+                  let setParams = [msgStatus];
+                  if (msgStatus === 'read') {
+                    setClause = 'status = ?, read_at = COALESCE(read_at, NOW())';
+                  } else if (msgStatus === 'delivered') {
+                    setClause = "status = CASE WHEN LOWER(status) = 'read' THEN status ELSE ? END, delivered_at = COALESCE(delivered_at, NOW())";
+                  } else if (msgStatus === 'sent') {
+                    setClause = "status = CASE WHEN LOWER(status) IN ('delivered', 'read') THEN status ELSE ? END";
+                  } else if (msgStatus === 'failed') {
+                    setClause = 'status = ?, error = ?';
+                    setParams = [msgStatus, formattedError];
+                  }
+                  [recipPhoneRes] = await pool.query(
+                    `UPDATE campaign_recipients 
+                     SET ${setClause}, message_id = COALESCE(message_id, ?) 
+                     WHERE (message_id = ? OR message_id = ? OR message_id IS NULL OR message_id = '') 
+                       AND (phone = ? OR phone = ? OR RIGHT(phone, 10) = ?) 
+                       AND sent_at >= NOW() - INTERVAL 2 DAY 
+                     ORDER BY id DESC LIMIT 1`,
+                    [...setParams, rawWamid, rawWamid, cleanWamid, recipientPhone, `+${recipientPhone}`, recipientPhone.slice(-10)]
+                  );
+                } catch (_) { }
+              }
+
+              const totalRecipUpdated = (recipRes?.affectedRows || 0) + (recipPhoneRes?.affectedRows || 0);
+              const totalMsgUpdated = msgRes?.affectedRows || 0;
+
+              console.log(`\n==================== [WEBHOOK STATUS DIAGNOSTIC] ====================`);
+              console.log(`WEBHOOK STATUS:\n${msgStatus}`);
+              console.log(`WAMID:\n${rawWamid}`);
+              console.log(`MESSAGE MATCH:\n${(totalRecipUpdated > 0 || totalMsgUpdated > 0) ? 'FOUND' : 'NOT FOUND'}`);
+              console.log(`campaign_recipients UPDATE:\n${totalRecipUpdated} row(s)`);
+              console.log(`messages UPDATE:\n${totalMsgUpdated} row(s)`);
+              console.log(`=====================================================================\n`);
+
+              const formattedStatus = msgStatus ? (msgStatus.charAt(0).toUpperCase() + msgStatus.slice(1)) : 'Sent';
+              if (recipientPhone) {
+                updateActivityStatus(recipientPhone, formattedStatus).catch(() => { });
+              }
+
+              const [msgRows] = await pool.query('SELECT conversation_id, organization_id FROM messages WHERE wa_message_id = ? OR wa_message_id = ? OR wa_message_id = ? LIMIT 1', [rawWamid, cleanWamid, prefixedWamid]).catch(() => [[]]);
+              const conversationId = msgRows.length > 0 ? msgRows[0].conversation_id : null;
+              const msgOrgId = msgRows.length > 0 ? msgRows[0].organization_id : orgId;
+
+              const statusData = {
+                wamid: rawWamid,
+                status: msgStatus,
+                conversationId,
+              };
+
+              if (msgOrgId) {
+                emitToOrganization(msgOrgId, 'message_status_updated', statusData);
+                emitToOrganization(msgOrgId, 'sending_history_updated', statusData);
+              } else {
+                emitSocketEvent('message_status_updated', statusData);
+                emitSocketEvent('sending_history_updated', statusData);
+              }
+            }
+          }
+        }
+      }
+    } catch (bgErr) {
+      console.error("[WEBHOOK ASYNC BG ERROR]:", bgErr.message);
+    }
+  });
+};

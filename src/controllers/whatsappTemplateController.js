@@ -1,0 +1,1138 @@
+import axios from 'axios';
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
+import { pool } from '../config/db.js';
+import whatsappConfig from '../config/whatsapp.js';
+import logger from '../utils/logger.js';
+import { decryptToken } from '../utils/encryption.js';
+import { fetchMetaTemplates, clearMetaTemplatesCache } from '../services/templateService.js';
+
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+/**
+ * Ensure whatsapp_templates table exists with all required fields
+ */
+export const ensureWhatsappTemplatesTable = async () => {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS whatsapp_templates (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        organization_id INT UNSIGNED DEFAULT NULL,
+        user_id INT NOT NULL,
+        meta_template_id VARCHAR(255) DEFAULT NULL,
+        template_name VARCHAR(255) NOT NULL,
+        language VARCHAR(50) NOT NULL DEFAULT 'en_US',
+        category VARCHAR(50) NOT NULL DEFAULT 'UTILITY',
+        template_type VARCHAR(50) DEFAULT 'STANDARD',
+        status ENUM('APPROVED', 'PENDING', 'REJECTED', 'PAUSED', 'DISABLED') DEFAULT 'PENDING',
+        header TEXT DEFAULT NULL,
+        header_media_url TEXT DEFAULT NULL,
+        meta_header_handle TEXT DEFAULT NULL,
+        media_type VARCHAR(50) DEFAULT NULL,
+        original_filename VARCHAR(255) DEFAULT NULL,
+        body TEXT NOT NULL,
+        footer TEXT DEFAULT NULL,
+        buttons_json LONGTEXT DEFAULT NULL,
+        variables_json LONGTEXT DEFAULT NULL,
+        meta_response LONGTEXT DEFAULT NULL,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        INDEX idx_org_id (organization_id),
+        INDEX idx_user_id (user_id),
+        INDEX idx_template_name (template_name),
+        INDEX idx_status (status)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+    `);
+
+    try { await pool.query('ALTER TABLE whatsapp_templates ADD COLUMN organization_id INT UNSIGNED DEFAULT NULL AFTER id'); } catch (_) {}
+    try { await pool.query('ALTER TABLE whatsapp_templates ADD COLUMN header_media_url TEXT DEFAULT NULL'); } catch (_) {}
+    try { await pool.query('ALTER TABLE whatsapp_templates ADD COLUMN meta_header_handle TEXT DEFAULT NULL'); } catch (_) {}
+    try { await pool.query('ALTER TABLE whatsapp_templates ADD COLUMN media_type VARCHAR(50) DEFAULT NULL'); } catch (_) {}
+    try { await pool.query('ALTER TABLE whatsapp_templates ADD COLUMN original_filename VARCHAR(255) DEFAULT NULL'); } catch (_) {}
+    try { await pool.query('ALTER TABLE templates ADD COLUMN organization_id INT UNSIGNED DEFAULT NULL'); } catch (_) {}
+    try { await pool.query('ALTER TABLE templates ADD COLUMN header_media_url TEXT DEFAULT NULL'); } catch (_) {}
+    try { await pool.query('ALTER TABLE templates ADD COLUMN meta_header_handle TEXT DEFAULT NULL'); } catch (_) {}
+  } catch (err) {
+    logger.error('[WhatsappTemplateController] Table setup error:', err.message);
+  }
+};
+
+// Initialize table on module import
+ensureWhatsappTemplatesTable();
+
+/**
+ * Map local language code to Meta Graph API language code format
+ */
+const formatLanguageCode = (lang) => {
+  if (!lang) return 'en_US';
+  const langMap = {
+    'en': 'en_US',
+    'en_US': 'en_US',
+    'en_GB': 'en_GB',
+    'hi': 'hi',
+    'gu': 'gu',
+    'mr': 'mr',
+    'ta': 'ta',
+    'te': 'te',
+    'bn': 'bn',
+    'kn': 'kn',
+    'ml': 'ml',
+    'pa': 'pa',
+    'ur': 'ur'
+  };
+  return langMap[lang] || lang;
+};
+
+/**
+ * Extract variable count from body text like {{1}}, {{2}}
+ */
+const extractVariables = (text) => {
+  if (!text) return [];
+  const matches = text.match(/\{\{(\d+)\}\}/g);
+  if (!matches) return [];
+  const uniqueVars = [...new Set(matches.map(m => m.replace(/[\{\}]/g, '')))];
+  return uniqueVars.sort((a, b) => parseInt(a, 10) - parseInt(b, 10));
+};
+
+/**
+ * Auto-format Phone Number into E.164 format (+CountryCode PhoneNumber) required by Meta API
+ */
+const formatPhoneNumberForMeta = (rawNum) => {
+  if (!rawNum) return '+919876543210';
+  let digits = String(rawNum).trim().replace(/[^\d+]/g, '');
+  if (!digits) return '+919876543210';
+  if (!digits.startsWith('+')) {
+    if (digits.length === 10) {
+      digits = '+91' + digits;
+    } else {
+      digits = '+' + digits;
+    }
+  }
+  return digits;
+};
+
+/**
+ * Auto-format URL for Meta API
+ */
+const formatUrlForMeta = (url) => {
+  if (!url || !String(url).trim()) {
+    throw new Error('Website URL is required for every URL button. No fallback URL was added.');
+  }
+  let trimmed = String(url).trim();
+  if (!trimmed.startsWith('http://') && !trimmed.startsWith('https://')) {
+    trimmed = 'https://' + trimmed;
+  }
+  try {
+    const parsed = new URL(trimmed);
+    if (!parsed.hostname || !parsed.hostname.includes('.')) throw new Error('Invalid hostname');
+  } catch (_) {
+    throw new Error(`Invalid website URL: ${trimmed}`);
+  }
+  return trimmed;
+};
+
+/**
+ * Obtains a valid Meta Header Handle for sample media via Meta Resumable Upload API
+ */
+export async function uploadTemplateMediaToMeta(fileBuffer, mimeType, appId, accessToken, apiVersion = 'v19.0') {
+  if (!fileBuffer || !appId || !accessToken) {
+    throw new Error('Missing fileBuffer, appId, or accessToken for Meta Resumable Upload');
+  }
+
+  logger.info(`[TEMPLATE_MEDIA_UPLOAD] Starting Meta Resumable Upload: mimeType=${mimeType}, size=${fileBuffer.length} bytes`);
+
+  // Step 1: Create Meta Resumable Upload Session
+  const sessionUrl = `https://graph.facebook.com/${apiVersion}/${appId}/uploads`;
+  const sessionRes = await axios.post(sessionUrl, null, {
+    params: {
+      file_length: fileBuffer.length,
+      file_type: mimeType,
+      access_token: accessToken
+    }
+  });
+
+  const uploadId = sessionRes.data?.id;
+  if (!uploadId) {
+    throw new Error(`Meta Resumable Upload session creation failed: ${JSON.stringify(sessionRes.data)}`);
+  }
+
+  logger.info(`[TEMPLATE_MEDIA_UPLOAD] Meta upload session created: uploadId=${uploadId}`);
+
+  // Step 2: Upload Binary Data to Meta Upload Session
+  const binaryUploadUrl = `https://graph.facebook.com/${apiVersion}/${uploadId}`;
+  const uploadRes = await axios.post(binaryUploadUrl, fileBuffer, {
+    headers: {
+      Authorization: `OAuth ${accessToken}`,
+      'file_offset': 0,
+      'Content-Type': 'application/octet-stream'
+    }
+  });
+
+  const headerHandle = uploadRes.data?.h;
+  if (!headerHandle) {
+    throw new Error(`Meta did not return an upload header handle: ${JSON.stringify(uploadRes.data)}`);
+  }
+
+  logger.info(`[TEMPLATE_MEDIA_UPLOAD] ✅ Meta upload handle received: ${headerHandle.substring(0, 15)}...`);
+  return headerHandle;
+}
+
+/**
+ * Resolves active organization WhatsApp account credentials
+ */
+export async function resolveOrganizationCredentials(req) {
+  const organizationId = req.organizationId || req.user?.organization_id || null;
+  const isSuperAdmin = req.user?.role === 'Super Admin';
+  const accountId = req.body?.accountId || req.query?.account_id || req.headers?.['x-account-id'] || null;
+
+  let targetWabaId = null;
+  let targetToken = null;
+  let targetPhoneNumberId = null;
+  let targetAppId = process.env.APP_ID || whatsappConfig.appId;
+  let activeOrgId = organizationId;
+  let activeAccountId = accountId;
+
+  if (accountId) {
+    let query = 'SELECT id, organization_id, waba_id, phone_number_id, access_token, status FROM whatsapp_accounts WHERE id = ?';
+    const params = [accountId];
+    if (organizationId && !isSuperAdmin) {
+      query += ' AND organization_id = ?';
+      params.push(organizationId);
+    }
+    const [rows] = await pool.query(query, params);
+    if (rows.length > 0) {
+      targetWabaId = rows[0].waba_id;
+      targetPhoneNumberId = rows[0].phone_number_id;
+      activeOrgId = rows[0].organization_id || organizationId;
+      activeAccountId = rows[0].id;
+      if (rows[0].access_token) {
+        try { targetToken = decryptToken(rows[0].access_token); } catch (_) {}
+      }
+    }
+  }
+
+  if (!targetWabaId && organizationId) {
+    const [rows] = await pool.query(
+      'SELECT id, organization_id, waba_id, phone_number_id, access_token, status FROM whatsapp_accounts WHERE organization_id = ? ORDER BY (status = "Active") DESC, id DESC LIMIT 1',
+      [organizationId]
+    );
+    if (rows.length > 0) {
+      targetWabaId = rows[0].waba_id;
+      targetPhoneNumberId = rows[0].phone_number_id;
+      activeOrgId = rows[0].organization_id || organizationId;
+      activeAccountId = rows[0].id;
+      if (rows[0].access_token) {
+        try { targetToken = decryptToken(rows[0].access_token); } catch (_) {}
+      }
+    }
+  }
+
+  // Fallback to server .env credentials ONLY IF Super Admin
+  if (!targetWabaId && isSuperAdmin) {
+    targetWabaId = whatsappConfig.businessAccountId;
+    targetToken = whatsappConfig.accessToken;
+    targetPhoneNumberId = whatsappConfig.phoneNumberId;
+    targetAppId = whatsappConfig.appId;
+  }
+
+  return {
+    wabaId: targetWabaId,
+    token: targetToken,
+    phoneNumberId: targetPhoneNumberId,
+    appId: targetAppId,
+    organizationId: activeOrgId,
+    accountId: activeAccountId,
+    isSuperAdmin
+  };
+}
+
+/**
+ * POST /api/meta/templates/create or /api/templates
+ * Submit template directly to Meta WhatsApp Cloud API for approval
+ */
+export const createMetaTemplate = async (req, res) => {
+  const userId = req.user?.id || 1;
+  const organizationId = req.organizationId || req.user?.organization_id || null;
+
+  // Resolve multi-tenant credentials
+  const creds = await resolveOrganizationCredentials(req);
+  if (!creds.wabaId || !creds.token) {
+    logger.error(`[TEMPLATE_CREATE] Missing WABA credentials for user=${userId}, org=${organizationId}`);
+    return res.status(400).json({
+      success: false,
+      message: 'No connected Meta WhatsApp Business Account (WABA) found for your organization. Please connect your WhatsApp account in Settings.'
+    });
+  }
+
+  const {
+    templateName,
+    name,
+    templateType = 'STANDARD',
+    language = 'en_US',
+    category = 'UTILITY',
+    header,
+    headerText,
+    headerFormat,
+    mediaBase64,
+    mediaMimeType,
+    mediaFileName,
+    message,
+    body,
+    footer,
+    buttons: rawButtons = [],
+    cards: rawCards = []
+  } = req.body;
+
+  // Parse buttons if sent as JSON string from FormData
+  let buttons = rawButtons;
+  if (typeof buttons === 'string') {
+    try { buttons = JSON.parse(buttons); } catch (_) { buttons = []; }
+  }
+
+  // Parse cards if sent as JSON string from FormData
+  let cards = rawCards;
+  if (typeof cards === 'string') {
+    try { cards = JSON.parse(cards); } catch (_) { cards = []; }
+  }
+
+  // Auto-sanitize template name to lowercase alphanumeric + underscores
+  const rawName = (templateName || name || '').trim().toLowerCase();
+  const finalName = rawName.replace(/[^a-z0-9_]/g, '_');
+  const finalBody = (message || body || '').trim();
+  const finalFooter = (footer || '').trim();
+  const finalHeader = (headerText || header || '').trim();
+  const finalCategory = (category || 'UTILITY').toUpperCase();
+  const finalLanguage = formatLanguageCode(language);
+  const hFormat = headerFormat && headerFormat !== 'NONE' && headerFormat !== 'text' ? headerFormat.toUpperCase() : null;
+
+  // 1. Validation Checks
+  if (!finalName) {
+    return res.status(400).json({ success: false, message: 'Template name is required.' });
+  }
+
+  const validNameRegex = /^[a-z0-9_]+$/;
+  if (!validNameRegex.test(finalName)) {
+    return res.status(400).json({
+      success: false,
+      message: 'Invalid template name format. Meta requires lowercase letters, numbers, and underscores only (e.g. order_confirmation_1).'
+    });
+  }
+
+  if (!finalBody) {
+    return res.status(400).json({ success: false, message: 'Body message content is required.' });
+  }
+
+  if (finalBody.length > 1024) {
+    return res.status(400).json({ success: false, message: 'Body message cannot exceed 1024 characters.' });
+  }
+
+  if (finalFooter.length > 60) {
+    return res.status(400).json({ success: false, message: 'Footer cannot exceed 60 characters.' });
+  }
+
+  if (templateType === 'carousel' && Array.isArray(cards) && cards.length > 0) {
+    const normalizeButtonType = type => {
+      const value = String(type || 'QUICK_REPLY').toUpperCase();
+      if (value === 'URL_LINK') return 'URL';
+      if (value === 'CALL_TO_ACTION') return 'PHONE_NUMBER';
+      return value;
+    };
+    const firstSchema = (Array.isArray(cards[0].buttons) ? cards[0].buttons : [])
+      .slice(0, 2)
+      .map(button => normalizeButtonType(button.type));
+
+    for (let i = 0; i < cards.length; i++) {
+      const cardButtons = (Array.isArray(cards[i].buttons) ? cards[i].buttons : []).slice(0, 2);
+      const schema = cardButtons.map(button => normalizeButtonType(button.type));
+      const sameSchema = schema.length === firstSchema.length && schema.every((type, index) => type === firstSchema[index]);
+      if (!sameSchema) {
+        return res.status(400).json({
+          success: false,
+          message: `Carousel Card #${i + 1} must have the same number and types of buttons as Card #1. Meta requires an identical button structure on every carousel card; buttons were not copied automatically.`
+        });
+      }
+      for (let buttonIndex = 0; buttonIndex < cardButtons.length; buttonIndex++) {
+        const button = cardButtons[buttonIndex];
+        const buttonType = normalizeButtonType(button.type);
+        if (buttonType === 'URL' && !String(button.url || button.actionValue || '').trim()) {
+          return res.status(400).json({
+            success: false,
+            message: `Card #${i + 1}, Button #${buttonIndex + 1}: enter the exact website URL or remove/change this URL button. No default website will be used.`
+          });
+        }
+      }
+    }
+  }
+
+  // Validate message language and script
+  
+
+  // 2. Validate & Extract Media File
+  let fileBuffer = null;
+  let fileMime = null;
+  let originalFilename = null;
+
+  if (req.file) {
+    fileBuffer = req.file.buffer;
+    fileMime = req.file.mimetype;
+    originalFilename = req.file.originalname;
+  } else if (mediaBase64) {
+    try {
+      const base64Data = mediaBase64.replace(/^data:[A-Za-z-+\/]+;base64,/, '');
+      fileBuffer = Buffer.from(base64Data, 'base64');
+      fileMime = mediaMimeType || (hFormat === 'VIDEO' ? 'video/mp4' : hFormat === 'DOCUMENT' ? 'application/pdf' : 'image/png');
+      originalFilename = mediaFileName || `media.${hFormat === 'VIDEO' ? 'mp4' : hFormat === 'DOCUMENT' ? 'pdf' : 'png'}`;
+    } catch (e) {
+      logger.warn('[WhatsappTemplateController] Base64 decode warning:', e.message);
+    }
+  }
+
+  // If header format is media, ensure media file exists and is valid
+  if (['IMAGE', 'VIDEO', 'DOCUMENT'].includes(hFormat)) {
+    if (!fileBuffer || fileBuffer.length === 0) {
+      // Create fallback transparent 1x1 image buffer or sample buffer if none provided
+      if (hFormat === 'IMAGE') {
+        fileBuffer = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==', 'base64');
+        fileMime = 'image/png';
+        originalFilename = 'sample.png';
+      } else if (hFormat === 'VIDEO') {
+        return res.status(400).json({
+          success: false,
+          message: 'Please upload a valid MP4 video. Video file is required.'
+        });
+      } else {
+        fileBuffer = Buffer.from('%PDF-1.4\n1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj\n3 0 obj<</Type/Page/MediaBox[0 0 612 792]>>endobj\nxref\n0 4\n0000000000 65535 f \n0000000010 00000 n \n0000000053 00000 n \n0000000102 00000 n \ntrailer<</Size 4/Root 1 0 R>>\nstartxref\n149\n%%EOF');
+        fileMime = 'application/pdf';
+        originalFilename = 'sample.pdf';
+      }
+    }
+
+    // Validate MIME types & size limits
+    if (hFormat === 'IMAGE') {
+      if (!['image/jpeg', 'image/jpg', 'image/png', 'image/webp'].includes(fileMime)) {
+        return res.status(400).json({
+          success: false,
+          message: `Invalid image format: "${fileMime}". Meta requires JPEG or PNG format for template image headers.`
+        });
+      }
+      if (fileBuffer.length > 5 * 1024 * 1024) {
+        return res.status(400).json({
+          success: false,
+          message: `Image size (${(fileBuffer.length / (1024 * 1024)).toFixed(1)} MB) exceeds maximum limit of 5 MB for WhatsApp template headers.`
+        });
+      }
+    } else if (hFormat === 'VIDEO') {
+      if (fileBuffer.length > 16 * 1024 * 1024) {
+        return res.status(400).json({
+          success: false,
+          message: `Video size (${(fileBuffer.length / (1024 * 1024)).toFixed(1)} MB) exceeds maximum limit of 16 MB for WhatsApp template headers.`
+        });
+      }
+    } else if (hFormat === 'DOCUMENT') {
+      if (fileBuffer.length > 50 * 1024 * 1024) {
+        return res.status(400).json({
+          success: false,
+          message: `Document size (${(fileBuffer.length / (1024 * 1024)).toFixed(1)} MB) exceeds maximum limit of 50 MB for WhatsApp template headers.`
+        });
+      }
+    }
+  }
+
+  // Automatically normalize standard video-template media before Meta approval.
+  if (hFormat === 'VIDEO' && fileBuffer?.length) {
+    const { execFileSync } = await import('node:child_process');
+    const os = await import('node:os');
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'waba-video-'));
+    const inputPath = path.join(tempDir, 'input.mp4');
+    const outputPath = path.join(tempDir, 'output.mp4');
+
+    try {
+      fs.writeFileSync(inputPath, fileBuffer);
+
+      const probe = JSON.parse(execFileSync('ffprobe', [
+        '-v', 'error', '-show_streams', '-of', 'json', inputPath
+      ], { timeout: 30000 }).toString());
+
+      const video = probe.streams?.find(x => x.codec_type === 'video');
+      const audio = probe.streams?.filter(x => x.codec_type === 'audio') || [];
+
+      if (!video) throw new Error('No valid video stream found');
+
+      if (video.codec_name !== 'h264' ||
+          video.pix_fmt !== 'yuv420p' ||
+          audio.some(x => x.codec_name !== 'aac')) {
+
+        logger.info('[TEMPLATE_CREATE] Converting video to H264/AAC MP4');
+
+        execFileSync('ffmpeg', [
+          '-hide_banner', '-loglevel', 'error', '-y',
+          '-i', inputPath,
+          '-map', '0:v:0', '-map', '0:a?',
+          '-c:v', 'libx264',
+          '-preset', 'fast',
+          '-crf', '27',
+          '-pix_fmt', 'yuv420p',
+          '-profile:v', 'main',
+          '-c:a', 'aac',
+          '-b:a', '128k',
+          '-movflags', '+faststart',
+          outputPath
+        ], { timeout: 180000 });
+
+        fileBuffer = fs.readFileSync(outputPath);
+        fileMime = 'video/mp4';
+        originalFilename = path.parse(originalFilename || 'video').name + '.mp4';
+      }
+
+      if (fileBuffer.length > 16 * 1024 * 1024) {
+        throw new Error('Converted video exceeds 16 MB');
+      }
+
+      const verifiedPath = fs.existsSync(outputPath) ? outputPath : inputPath;
+      const verified = JSON.parse(execFileSync('ffprobe', [
+        '-v', 'error', '-show_streams', '-of', 'json', verifiedPath
+      ], { timeout: 30000 }).toString());
+
+      const v = verified.streams?.find(x => x.codec_type === 'video');
+      const a = verified.streams?.filter(x => x.codec_type === 'audio') || [];
+
+      if (v?.codec_name !== 'h264' || v.pix_fmt !== 'yuv420p' ||
+          a.some(x => x.codec_name !== 'aac')) {
+        throw new Error('Video codec validation failed');
+      }
+
+      fileMime = 'video/mp4';
+      logger.info(`[TEMPLATE_CREATE] Video validated: ${fileBuffer.length} bytes`);
+
+    } catch (videoErr) {
+      logger.error('[TEMPLATE_CREATE] Video conversion failed:', videoErr.message);
+      return res.status(400).json({
+        success: false,
+        message: 'Video processing failed: ' + videoErr.message
+      });
+    } finally {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+  }
+
+  try {
+    logger.info(`[TEMPLATE_CREATE] organizationId=${creds.organizationId}, wabaId=${creds.wabaId}, templateName=${finalName}`);
+
+    // 3. Upload Sample Media to Meta via Resumable Upload API to obtain header_handle
+    let headerHandle = null;
+    if (['IMAGE', 'VIDEO', 'DOCUMENT'].includes(hFormat) && fileBuffer) {
+      try {
+        headerHandle = await uploadTemplateMediaToMeta(
+          fileBuffer,
+          fileMime,
+          creds.appId,
+          creds.token,
+          whatsappConfig.apiVersion || 'v19.0'
+        );
+      } catch (uploadErr) {
+        logger.error(`[TEMPLATE_CREATE] Meta media upload failed:`, uploadErr.response?.data || uploadErr.message);
+        return res.status(400).json({
+          success: false,
+          message: `Failed to upload template media to Meta: ${uploadErr.response?.data?.error?.message || uploadErr.message}`,
+          meta_error: uploadErr.response?.data?.error || uploadErr.message
+        });
+      }
+    }
+
+    // 4. Construct Meta Graph API Payload Components
+    const components = [];
+
+    // HEADER Component
+    if (finalHeader) {
+      components.push({
+        type: 'HEADER',
+        format: 'TEXT',
+        text: finalHeader
+      });
+    } else if (hFormat) {
+      const headerComp = {
+        type: 'HEADER',
+        format: hFormat
+      };
+
+      if (headerHandle) {
+        headerComp.example = {
+          header_handle: [headerHandle]
+        };
+      }
+      components.push(headerComp);
+    }
+
+    // BODY Component
+    const variables = extractVariables(finalBody);
+    const bodyComponent = {
+      type: 'BODY',
+      text: finalBody
+    };
+
+    let userSamples = [];
+    if (req.body.variableSamples) {
+      try {
+        const parsed = typeof req.body.variableSamples === 'string' ? JSON.parse(req.body.variableSamples) : req.body.variableSamples;
+        userSamples = variables.map(v => (parsed && parsed[v] && String(parsed[v]).trim()) ? String(parsed[v]).trim() : `Sample_${v}`);
+      } catch (_) {}
+    }
+
+    if (variables.length > 0) {
+      const sampleValues = userSamples.length === variables.length ? userSamples : variables.map(v => `Sample_${v}`);
+      bodyComponent.example = {
+        body_text: [sampleValues]
+      };
+    }
+    components.push(bodyComponent);
+
+    // FOOTER Component
+    if (finalFooter) {
+      components.push({
+        type: 'FOOTER',
+        text: finalFooter
+      });
+    }
+
+    // CAROUSEL Component (For Carousel Templates)
+    if (templateType === 'carousel' && Array.isArray(cards) && cards.length > 0) {
+      logger.info(`[TEMPLATE_CREATE] Processing Carousel with ${cards.length} cards...`);
+
+      // Ensure minimum 2 cards for Meta Carousel requirement
+      let carouselCardsList = [...cards];
+      if (carouselCardsList.length === 1) {
+        carouselCardsList.push({
+          ...carouselCardsList[0],
+          id: Date.now() + 1,
+          body: carouselCardsList[0].body ? `${carouselCardsList[0].body} (Card 2)` : 'Card 2 Details'
+        });
+      }
+
+      const formattedCarouselCards = [];
+
+      for (let i = 0; i < carouselCardsList.length; i++) {
+        const c = carouselCardsList[i];
+        const cardComponents = [];
+
+        // 1. Upload card media to Meta via Resumable Upload API to get header_handle
+        let cardHeaderHandle = null;
+        let cBuffer = null;
+        const isCardVideo = (c.mediaType === 'video' || (c.mediaMimeType && c.mediaMimeType.startsWith('video/')));
+        let cMime = c.mediaMimeType || (isCardVideo ? 'video/mp4' : 'image/png');
+
+        if (c.mediaBase64 || (c.headerMedia && c.headerMedia.startsWith('data:'))) {
+          try {
+            const rawB64 = (c.mediaBase64 || c.headerMedia).replace(/^data:[A-Za-z0-9-+/]+;base64,/, '');
+            cBuffer = Buffer.from(rawB64, 'base64');
+          } catch (e) {
+            cBuffer = null;
+          }
+        }
+
+        // On edit, reuse the exact locally persisted card image instead of
+        // replacing it with a generated sample image.
+        if ((!cBuffer || cBuffer.length === 0) && typeof c.headerMedia === 'string' && c.headerMedia.startsWith('/uploads/')) {
+          const relativeUploadPath = c.headerMedia.replace(/^\/uploads\//, '').replace(/[\\/]+/g, path.sep);
+          const uploadRoots = [
+            path.join(__dirname, '..', '..', 'uploads'),
+            path.join(process.cwd(), 'uploads'),
+            path.join(process.cwd(), 'backend', 'uploads')
+          ];
+          for (const uploadRoot of uploadRoots) {
+            const candidate = path.resolve(uploadRoot, relativeUploadPath);
+            const resolvedRoot = path.resolve(uploadRoot) + path.sep;
+            if (candidate.startsWith(resolvedRoot) && fs.existsSync(candidate) && fs.statSync(candidate).isFile()) {
+              cBuffer = fs.readFileSync(candidate);
+              const existingExt = path.extname(candidate).toLowerCase();
+              if (existingExt === '.jpg' || existingExt === '.jpeg') cMime = 'image/jpeg';
+              else if (existingExt === '.webp') cMime = 'image/webp';
+              else if (existingExt === '.mp4') cMime = 'video/mp4';
+              else if (existingExt === '.webm') cMime = 'video/webm';
+              else if (existingExt === '.png') cMime = 'image/png';
+              break;
+            }
+          }
+        }
+
+        if (cBuffer) {
+          if (isCardVideo && cBuffer.length > 16 * 1024 * 1024) {
+            return res.status(400).json({
+              success: false,
+              message: `Card #${i + 1} video size (${(cBuffer.length / (1024 * 1024)).toFixed(1)} MB) exceeds maximum limit of 16 MB.`
+            });
+          }
+          if (!isCardVideo && cBuffer.length > 5 * 1024 * 1024) {
+            return res.status(400).json({
+              success: false,
+              message: `Card #${i + 1} image size (${(cBuffer.length / (1024 * 1024)).toFixed(1)} MB) exceeds maximum limit of 5 MB.`
+            });
+          }
+        }
+
+        if (!cBuffer || cBuffer.length === 0) {
+          return res.status(400).json({
+            success: false,
+            message: `Card #${i + 1} media could not be read. Please select the intended ${isCardVideo ? 'video' : 'image'} again; no fallback image was submitted.`
+          });
+        }
+
+        try {
+          cardHeaderHandle = await uploadTemplateMediaToMeta(
+            cBuffer,
+            cMime,
+            creds.appId,
+            creds.token,
+            whatsappConfig.apiVersion || 'v19.0'
+          );
+          logger.info(`[TEMPLATE_CREATE] Card #${i + 1} (${isCardVideo ? 'VIDEO' : 'IMAGE'}) header_handle obtained: ${cardHeaderHandle}`);
+        } catch (cUploadErr) {
+          logger.warn(`[TEMPLATE_CREATE] Card #${i + 1} media upload warning:`, cUploadErr.message);
+        }
+
+        // Add HEADER to Card
+        const cardHeaderComp = {
+          type: 'HEADER',
+          format: isCardVideo ? 'VIDEO' : 'IMAGE'
+        };
+        if (cardHeaderHandle) {
+          cardHeaderComp.example = {
+            header_handle: [cardHeaderHandle]
+          };
+        }
+        cardComponents.push(cardHeaderComp);
+
+        // Add BODY to Card
+        const cardBodyText = (c.body || `Card ${i + 1}`).trim();
+        const cardVars = extractVariables(cardBodyText);
+        const cardBodyComp = {
+          type: 'BODY',
+          text: cardBodyText
+        };
+        if (cardVars.length > 0) {
+          cardBodyComp.example = {
+            body_text: [cardVars.map(v => `Sample_${v}`)]
+          };
+        }
+        cardComponents.push(cardBodyComp);
+
+        // Meta requires every carousel card to have the same button count and
+        // button types in the same order. Use card #1 as the schema, while
+        // retaining each card's own labels and action values.
+        const defaultButton = { type: 'QUICK_REPLY', text: 'View Details' };
+        const canonicalButtons = (Array.isArray(carouselCardsList[0]?.buttons) && carouselCardsList[0].buttons.length > 0
+          ? carouselCardsList[0].buttons
+          : [defaultButton]).slice(0, 2);
+        const currentButtons = Array.isArray(c.buttons) ? c.buttons.slice(0, 2) : [];
+
+        const formattedCardButtons = canonicalButtons.map((schemaButton, buttonIndex) => {
+          const cardButton = currentButtons[buttonIndex];
+          let canonicalType = schemaButton.type || 'QUICK_REPLY';
+          if (canonicalType === 'URL_LINK') canonicalType = 'URL';
+          if (canonicalType === 'CALL_TO_ACTION') canonicalType = 'PHONE_NUMBER';
+
+          const text = (cardButton.text || schemaButton.text || `Button ${buttonIndex + 1}`)
+            .trim()
+            .slice(0, 25);
+
+          if (canonicalType === 'URL') {
+            return {
+              type: 'URL',
+              text,
+              url: formatUrlForMeta(cardButton.url || cardButton.actionValue || schemaButton.url || schemaButton.actionValue)
+            };
+          }
+          if (canonicalType === 'PHONE_NUMBER') {
+            return {
+              type: 'PHONE_NUMBER',
+              text,
+              phone_number: formatPhoneNumberForMeta(cardButton.phoneNumber || cardButton.actionValue || schemaButton.phoneNumber || schemaButton.actionValue)
+            };
+          }
+          return { type: 'QUICK_REPLY', text };
+        });
+
+        cardComponents.push({
+          type: 'BUTTONS',
+          buttons: formattedCardButtons
+        });
+
+        formattedCarouselCards.push({
+          components: cardComponents
+        });
+      }
+
+      components.push({
+        type: 'CAROUSEL',
+        cards: formattedCarouselCards
+      });
+    } else if (Array.isArray(buttons) && buttons.length > 0) {
+      // Standard BUTTONS Component for non-carousel templates
+      const formattedButtons = [];
+      for (const btn of buttons) {
+        if (!btn.text && !btn.type) continue;
+        const bType = btn.type || 'QUICK_REPLY';
+
+        if (bType === 'QUICK_REPLY') {
+          formattedButtons.push({
+            type: 'QUICK_REPLY',
+            text: btn.text || 'Quick Reply'
+          });
+        } else if (bType === 'CALL_TO_ACTION' || bType === 'PHONE_NUMBER') {
+          formattedButtons.push({
+            type: 'PHONE_NUMBER',
+            text: btn.text || 'Call Us',
+            phone_number: formatPhoneNumberForMeta(btn.phoneNumber)
+          });
+        } else if (bType === 'URL_LINK' || bType === 'URL') {
+          formattedButtons.push({
+            type: 'URL',
+            text: btn.text || 'Visit Website',
+            url: formatUrlForMeta(btn.url)
+          });
+        } else if (bType === 'COPY_CODE') {
+          formattedButtons.push({
+            type: 'COPY_CODE',
+            example: btn.couponCode || 'SAVE50'
+          });
+        }
+      }
+
+      if (formattedButtons.length > 0) {
+        components.push({
+          type: 'BUTTONS',
+          buttons: formattedButtons
+        });
+      }
+    }
+
+    const metaPayload = {
+      name: finalName,
+      category: finalCategory,
+      language: finalLanguage,
+      components
+    };
+
+    const isEditMode = (req.body.isEdit === 'true' || req.body.isEdit === true || Boolean(req.body.editId));
+
+    // 1. Check if the template actively exists on Meta by querying Meta API directly
+    let liveMetaTemplateId = null;
+    try {
+      const searchRes = await axios.get(
+        `https://graph.facebook.com/${whatsappConfig.apiVersion || 'v19.0'}/${creds.wabaId}/message_templates?name=${encodeURIComponent(finalName)}`,
+        {
+          headers: { Authorization: `Bearer ${creds.token}` },
+          timeout: 10000
+        }
+      );
+      if (searchRes.data?.data?.length > 0) {
+        const found = searchRes.data.data.find(t => t.name === finalName) || searchRes.data.data[0];
+        if (found?.id) {
+          liveMetaTemplateId = found.id;
+          logger.info(`[TEMPLATE_CHECK] Verified live Meta template ID on Meta: ${liveMetaTemplateId} (${finalName})`);
+        }
+      }
+    } catch (searchErr) {
+      logger.warn(`[TEMPLATE_CHECK] Meta search notice:`, searchErr.message);
+    }
+
+    logger.info(`[TEMPLATE_SUBMIT] Submitting to Meta WABA ${creds.wabaId} (isEdit=${isEditMode}, liveMetaId=${liveMetaTemplateId}): ${JSON.stringify(metaPayload)}`);
+
+    // 2. Submit to Meta Graph API
+    let response = null;
+    let metaResult = null;
+    let metaTemplateId = null;
+    let metaStatus = 'PENDING';
+
+    // If template exists on Meta, update it via POST /{liveMetaTemplateId}
+    if (liveMetaTemplateId) {
+      try {
+        logger.info(`[TEMPLATE_EDIT] Resubmitting template ID ${liveMetaTemplateId} to Meta for approval...`);
+        const editEndpoint = `https://graph.facebook.com/${whatsappConfig.apiVersion || 'v19.0'}/${liveMetaTemplateId}`;
+        response = await axios.post(editEndpoint, { components }, {
+          headers: {
+            Authorization: `Bearer ${creds.token}`,
+            'Content-Type': 'application/json'
+          }
+        });
+        metaResult = response.data;
+        metaTemplateId = liveMetaTemplateId;
+        metaStatus = metaResult.status || 'PENDING';
+        logger.info(`[TEMPLATE_EDIT] ✅ Successfully resubmitted template ${liveMetaTemplateId} to Meta!`);
+      } catch (updateErr) {
+        logger.warn(`[TEMPLATE_EDIT] Direct update failed (${updateErr.response?.data?.error?.message || updateErr.message}), attempting create endpoint...`);
+        response = null;
+      }
+    }
+
+    // If not existing on Meta or update failed, submit to create endpoint
+    if (!response) {
+      const createEndpoint = `https://graph.facebook.com/${whatsappConfig.apiVersion || 'v19.0'}/${creds.wabaId}/message_templates`;
+      response = await axios.post(createEndpoint, metaPayload, {
+        headers: {
+          Authorization: `Bearer ${creds.token}`,
+          'Content-Type': 'application/json'
+        }
+      });
+      metaResult = response.data;
+      metaTemplateId = metaResult.id || null;
+      metaStatus = metaResult.status || 'PENDING';
+      logger.info(`[TEMPLATE_CREATE] ✅ Template created on Meta! ID: ${metaTemplateId}, Status: ${metaStatus}`);
+    }
+
+    logger.info(`[TEMPLATE_META_CREATE] ✅ Template successfully registered on Meta! ID: ${metaTemplateId}, Status: ${metaStatus}`);
+
+    // 6. Save media file locally on server ONLY after Meta success
+    let savedMediaUrl = null;
+    if (fileBuffer && hFormat) {
+      try {
+        const ext = (originalFilename && path.extname(originalFilename)) || (hFormat === 'VIDEO' ? '.mp4' : hFormat === 'DOCUMENT' ? '.pdf' : '.png');
+        const safeFileName = `template_${finalName}_${Date.now()}${ext}`;
+        const uploadDir = path.join(__dirname, '..', '..', 'uploads', 'templates');
+        if (!fs.existsSync(uploadDir)) {
+          fs.mkdirSync(uploadDir, { recursive: true });
+        }
+        fs.writeFileSync(path.join(uploadDir, safeFileName), fileBuffer);
+        savedMediaUrl = `/uploads/templates/${safeFileName}`;
+
+        // Also ensure fallback backend/uploads path exists if process.cwd is different
+        try {
+          const altDir = path.join(process.cwd(), 'uploads', 'templates');
+          if (altDir !== uploadDir && fs.existsSync(path.dirname(altDir))) {
+            fs.mkdirSync(altDir, { recursive: true });
+            fs.writeFileSync(path.join(altDir, safeFileName), fileBuffer);
+          }
+        } catch (_) {}
+
+        logger.info(`[TEMPLATE_CREATE] Persisted template media locally: ${savedMediaUrl}`);
+      } catch (fErr) {
+        logger.warn('[WhatsappTemplateController] File persistence warning:', fErr.message);
+      }
+    }
+
+    // Persist Carousel Card media files to disk
+    let savedCards = [];
+    if (templateType === 'carousel' && Array.isArray(cards)) {
+      const uploadDir = path.join(__dirname, '..', '..', 'uploads', 'templates');
+      if (!fs.existsSync(uploadDir)) {
+        try { fs.mkdirSync(uploadDir, { recursive: true }); } catch (_) {}
+      }
+
+      for (let i = 0; i < cards.length; i++) {
+        const c = cards[i];
+        let cardSavedUrl = null;
+        let cBuf = null;
+        const isCardVideo = (c.mediaType === 'video' || (c.mediaMimeType && c.mediaMimeType.startsWith('video/')));
+        const ext = isCardVideo ? '.mp4' : '.png';
+
+        if (c.mediaBase64 || (c.headerMedia && c.headerMedia.startsWith('data:'))) {
+          try {
+            const rawB64 = (c.mediaBase64 || c.headerMedia).replace(/^data:[A-Za-z0-9-+/]+;base64,/, '');
+            cBuf = Buffer.from(rawB64, 'base64');
+          } catch (_) {}
+        }
+
+        if (cBuf && cBuf.length > 0) {
+          try {
+            const safeCardName = `card_${finalName}_${i + 1}_${Date.now()}${ext}`;
+            fs.writeFileSync(path.join(uploadDir, safeCardName), cBuf);
+            cardSavedUrl = `/uploads/templates/${safeCardName}`;
+            logger.info(`[TEMPLATE_CREATE] Persisted Card #${i + 1} media locally: ${cardSavedUrl}`);
+          } catch (e) {
+            logger.warn('[WhatsappTemplateController] Card file write error:', e.message);
+          }
+        } else if (c.headerMedia && typeof c.headerMedia === 'string' && !c.headerMedia.startsWith('data:')) {
+          cardSavedUrl = c.headerMedia;
+        }
+
+        savedCards.push({
+          id: c.id || (i + 1),
+          body: c.body || `Card ${i + 1}`,
+          headerMedia: cardSavedUrl || '',
+          mediaType: isCardVideo ? 'video' : 'image',
+          buttons: Array.isArray(c.buttons) && c.buttons.length > 0 ? c.buttons : [{ type: 'QUICK_REPLY', text: 'View Details' }]
+        });
+      }
+    }
+
+    const fullMetaResponse = {
+      ...metaResult,
+      cards: savedCards.length > 0 ? savedCards : undefined
+    };
+
+    // 7. Save into whatsapp_templates database table
+    const [insertResult] = await pool.query(
+      `INSERT INTO whatsapp_templates 
+       (organization_id, user_id, meta_template_id, template_name, language, category, template_type, status, header, header_media_url, meta_header_handle, media_type, original_filename, body, footer, buttons_json, variables_json, meta_response, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())`,
+      [
+        creds.organizationId || null,
+        userId,
+        metaTemplateId,
+        finalName,
+        finalLanguage,
+        finalCategory,
+        templateType,
+        metaStatus,
+        finalHeader || null,
+        savedMediaUrl || null,
+        headerHandle || null,
+        hFormat || null,
+        originalFilename || null,
+        finalBody,
+        finalFooter || null,
+        JSON.stringify(buttons),
+        JSON.stringify(variables),
+        JSON.stringify(fullMetaResponse)
+      ]
+    );
+
+    // 8. Also sync into unified templates table for manage templates screen
+    try {
+      const [existingTpl] = await pool.query('SELECT id FROM templates WHERE (user_id = ? OR organization_id = ?) AND name = ?', [userId, creds.organizationId || 0, finalName]);
+      if (existingTpl.length > 0) {
+        await pool.query(
+          `UPDATE templates SET organization_id = COALESCE(?, organization_id), message = ?, category = ?, status = ?, quality = 'HIGH', language = ?, header_media_url = COALESCE(?, header_media_url), meta_header_handle = COALESCE(?, meta_header_handle) WHERE id = ?`,
+          [creds.organizationId || null, finalBody, finalCategory, metaStatus, finalLanguage, savedMediaUrl || null, headerHandle || null, existingTpl[0].id]
+        );
+      } else {
+        await pool.query(
+          `INSERT INTO templates (organization_id, user_id, name, message, category, status, quality, language, header_media_url, meta_header_handle, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, 'HIGH', ?, ?, ?, NOW())`,
+          [creds.organizationId || null, userId, finalName, finalBody, finalCategory, metaStatus, finalLanguage, savedMediaUrl || null, headerHandle || null]
+        );
+      }
+    } catch (dbSyncErr) {
+      logger.warn('[WhatsappTemplateController] DB sync warning:', dbSyncErr.message);
+    }
+
+    clearMetaTemplatesCache();
+
+    return res.status(200).json({
+      success: true,
+      message: `Template "${finalName}" successfully submitted to Meta WhatsApp Business API for approval!`,
+      data: {
+        id: insertResult.insertId,
+        meta_template_id: metaTemplateId,
+        template_name: finalName,
+        status: metaStatus,
+        category: finalCategory,
+        language: finalLanguage,
+        header_media_url: savedMediaUrl,
+        meta_header_handle: headerHandle,
+        meta_response: metaResult
+      }
+    });
+
+  } catch (error) {
+    const metaErrorObj = error.response?.data?.error;
+    const metaErrorMsg = metaErrorObj?.error_user_msg || metaErrorObj?.message || error.message;
+
+    logger.error('[WhatsappTemplateController] ❌ Meta Graph API submission error:', metaErrorMsg);
+    logger.error('[WhatsappTemplateController] Full error payload:', JSON.stringify(error.response?.data || error.message));
+
+    // Handle standard Meta error messages cleanly for user UI
+    let userFriendlyMsg = metaErrorMsg;
+    if (metaErrorMsg.includes('already exists')) {
+      userFriendlyMsg = `Template name "${finalName}" already exists in your Meta WhatsApp Business Account. Please use a unique name.`;
+    } else if (metaErrorMsg.includes('Unsupported language')) {
+      userFriendlyMsg = `Language "${finalLanguage}" is not supported for category "${finalCategory}" by Meta.`;
+    } else if (metaErrorMsg.includes('variable')) {
+      userFriendlyMsg = `Invalid variable format in template body. Ensure variables use sequential numbers like {{1}}, {{2}}.`;
+    }
+
+    return res.status(400).json({
+      success: false,
+      message: userFriendlyMsg,
+      meta_error: metaErrorObj || error.message
+    });
+  }
+};
+
+/**
+ * GET /api/meta/templates/sync or /api/templates/sync
+ * Fetch live template statuses from Meta Graph API for active organization and update database
+ */
+export const syncMetaTemplateStatuses = async (req, res) => {
+  const userId = req.user?.id || 1;
+  const organizationId = req.organizationId || req.user?.organization_id || null;
+
+  try {
+    const creds = await resolveOrganizationCredentials(req);
+    if (!creds.wabaId || !creds.token) {
+      return res.status(400).json({
+        success: false,
+        message: 'No connected WhatsApp Business Account found for your organization.'
+      });
+    }
+
+    const endpoint = `https://graph.facebook.com/${whatsappConfig.apiVersion || 'v19.0'}/${creds.wabaId}/message_templates?limit=250`;
+    logger.info(`[TEMPLATE_SYNC] Fetching live template statuses from Meta WABA: ${creds.wabaId}`);
+
+    const response = await axios.get(endpoint, {
+      headers: {
+        Authorization: `Bearer ${creds.token}`,
+        'Content-Type': 'application/json'
+      },
+      timeout: 10000
+    });
+
+    const metaTemplates = response.data?.data || [];
+    let updatedCount = 0;
+
+    for (const metaTpl of metaTemplates) {
+      const bodyComp = (metaTpl.components || []).find(c => c.type === 'BODY');
+      const headerComp = (metaTpl.components || []).find(c => c.type === 'HEADER');
+      const messageText = bodyComp ? bodyComp.text : metaTpl.name;
+      const status = metaTpl.status || 'APPROVED';
+      const metaHeaderHandle = headerComp?.example?.header_handle?.[0] || null;
+
+      // Update whatsapp_templates table
+      await pool.query(
+        `UPDATE whatsapp_templates 
+         SET status = ?, meta_header_handle = COALESCE(?, meta_header_handle), meta_response = ? 
+         WHERE organization_id = ? AND (meta_template_id = ? OR template_name = ?)`,
+        [status, metaHeaderHandle, JSON.stringify(metaTpl), creds.organizationId || organizationId, metaTpl.id, metaTpl.name]
+      ).catch(() => {});
+
+      // Update or Insert into templates table
+      const [existing] = await pool.query(
+        'SELECT id, header_media_url FROM templates WHERE (organization_id = ? OR user_id = ?) AND name = ?',
+        [creds.organizationId || organizationId || 0, userId, metaTpl.name]
+      ).catch(() => [[]]);
+
+      if (existing.length > 0) {
+        await pool.query(
+          `UPDATE templates SET organization_id = COALESCE(?, organization_id), message = ?, category = ?, status = ?, language = ?, meta_header_handle = COALESCE(?, meta_header_handle) WHERE id = ?`,
+          [creds.organizationId || organizationId, messageText, metaTpl.category || 'UTILITY', status, metaTpl.language || 'en_US', metaHeaderHandle, existing[0].id]
+        ).catch(() => {});
+      } else {
+        await pool.query(
+          `INSERT INTO templates (organization_id, user_id, name, message, category, status, quality, language, meta_header_handle, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, 'HIGH', ?, ?, NOW())`,
+          [creds.organizationId || organizationId, userId, metaTpl.name, messageText, metaTpl.category || 'UTILITY', status, metaTpl.language || 'en_US', metaHeaderHandle]
+        ).catch(() => {});
+      }
+      updatedCount++;
+    }
+
+    clearMetaTemplatesCache();
+
+    return res.json({
+      success: true,
+      message: `Successfully synchronized ${updatedCount} template(s) directly from Meta WhatsApp Business Manager.`,
+      count: updatedCount
+    });
+
+  } catch (error) {
+    const errorMsg = error.response?.data?.error?.message || error.message;
+    logger.error('[TEMPLATE_SYNC] Failed to sync templates from Meta:', errorMsg);
+    return res.status(500).json({
+      success: false,
+      message: `Failed to sync templates from Meta: ${errorMsg}`,
+      meta_error: error.response?.data?.error || error.message
+    });
+  }
+};

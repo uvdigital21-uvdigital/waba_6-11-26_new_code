@@ -1,0 +1,548 @@
+/* ============================================================
+   CHATBOT MANAGER - 2026 ENTERPRISE SAAS STYLING
+   ============================================================ */
+
+.chatbot-page-container {
+  padding: 32px;
+  background-color: #F8FAFC;
+  min-height: 100%;
+  font-family: 'Plus Jakarta Sans', 'Inter', -apple-system, sans-serif;
+  color: #111827;
+  max-width: 1400px;
+  margin: 0 auto;
+}
+
+/* Header Flex Row */
+.chatbot-page-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 28px;
+  flex-wrap: wrap;
+  gap: 20px;
+  background: #FFFFFF;
+  padding: 24px 32px;
+  border-radius: 24px;
+  border: 1px solid #E5E7EB;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.04);
+}
+
+.chatbot-header-left {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+
+.chatbot-avatar-container {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 50px;
+  height: 50px;
+  border-radius: 16px;
+  background: linear-gradient(135deg, #6366F1, #4F46E5);
+  box-shadow: 0 8px 20px rgba(99, 102, 241, 0.25);
+  border: none;
+  flex-shrink: 0;
+}
+
+.chatbot-avatar-container svg {
+  width: 26px;
+  height: 26px;
+  color: #FFFFFF !important;
+}
+
+.chatbot-page-title {
+  font-size: 24px;
+  font-weight: 800;
+  color: #111827;
+  letter-spacing: -0.02em;
+  margin: 0;
+  white-space: nowrap;
+}
+
+.chatbot-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+/* Standard Premium Buttons */
+.btn-cb {
+  height: 44px;
+  padding: 0 20px;
+  font-size: 13.5px;
+  font-weight: 700;
+  border: none;
+  border-radius: 12px;
+  color: #FFFFFF;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.btn-cb:hover {
+  transform: translateY(-1px);
+}
+
+.btn-cb.green {
+  background: linear-gradient(135deg, #10B981, #059669);
+  box-shadow: 0 4px 14px rgba(16, 185, 129, 0.25);
+}
+
+.btn-cb.green:hover {
+  box-shadow: 0 6px 18px rgba(16, 185, 129, 0.35);
+}
+
+.btn-cb.blue {
+  background: linear-gradient(135deg, #84cc16, #16a34a);
+  box-shadow: 0 4px 14px rgba(132, 204, 22, 0.25);
+}
+
+.btn-cb.blue:hover {
+  box-shadow: 0 6px 18px rgba(132, 204, 22, 0.35);
+}
+
+.btn-cb.purple {
+  background: linear-gradient(135deg, #8B5CF6, #7C3AED);
+  box-shadow: 0 4px 14px rgba(139, 92, 246, 0.25);
+}
+
+.btn-cb.purple:hover {
+  box-shadow: 0 6px 18px rgba(139, 92, 246, 0.35);
+}
+
+/* Chatbot Manager Search Specific Row */
+.chatbot-manager-search-row {
+  display: flex;
+  justify-content: flex-end;
+  margin-bottom: 16px;
+}
+
+.chatbot-manager-search-input {
+  width: 340px;
+  height: 44px;
+  border: 1px solid #E5E7EB;
+  padding: 0 16px;
+  border-radius: 12px;
+  font-size: 13.5px;
+  outline: none;
+  background-color: #FFFFFF;
+  color: #111827;
+  font-family: inherit;
+  transition: all 0.2s ease;
+}
+
+.chatbot-manager-search-input:focus {
+  border-color: #2563EB;
+  box-shadow: 0 0 0 4px rgba(37, 99, 235, 0.12);
+}
+
+.chatbot-manager-list-row {
+  display: flex;
+  justify-content: flex-end;
+  margin-bottom: 20px;
+}
+
+.btn-list-purple {
+  background: linear-gradient(135deg, #8B5CF6, #7C3AED);
+  color: #FFFFFF;
+  border: none;
+  border-radius: 12px;
+  width: 44px;
+  height: 44px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  box-shadow: 0 4px 14px rgba(139, 92, 246, 0.25);
+  transition: all 0.15s ease;
+}
+
+.btn-list-purple:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 6px 18px rgba(139, 92, 246, 0.35);
+}
+
+/* Card Content Container */
+.chatbot-table-card {
+  background: #FFFFFF;
+  border-radius: 24px;
+  border: 1px solid #E5E7EB;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.04);
+  overflow: hidden;
+  padding: 0;
+}
+
+/* Table Style */
+.chatbot-grid-table {
+  width: 100%;
+  border-collapse: collapse;
+  text-align: left;
+}
+
+.chatbot-grid-table th {
+  background: linear-gradient(135deg, #10B981, #059669);
+  color: #FFFFFF;
+  font-size: 13px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  padding: 16px 20px;
+  border: none;
+}
+
+.chatbot-grid-table td {
+  padding: 16px 20px;
+  font-size: 13.5px;
+  color: #111827;
+  border-bottom: 1px solid #F1F5F9;
+  vertical-align: middle;
+}
+
+.chatbot-grid-table tbody tr {
+  transition: background 0.15s ease;
+}
+
+.chatbot-grid-table tbody tr:hover {
+  background-color: #F8FAFC;
+}
+
+.no-data-cell {
+  text-align: center;
+  padding: 48px 16px;
+  color: #64748B;
+  font-style: italic;
+}
+
+/* Actions */
+.btn-action-flow-edit {
+  background: linear-gradient(135deg, #a3e635, #15803d);
+  color: #FFFFFF;
+  border: none;
+  border-radius: 10px;
+  padding: 8px 16px;
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+  margin-right: 8px;
+  box-shadow: 0 2px 8px rgba(132, 204, 22, 0.25);
+  transition: all 0.15s ease;
+}
+
+.btn-action-flow-edit:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 4px 12px rgba(132, 204, 22, 0.35);
+}
+
+.btn-action-flow-delete {
+  background: linear-gradient(135deg, #EF4444, #DC2626);
+  color: #FFFFFF;
+  border: none;
+  border-radius: 10px;
+  padding: 8px 16px;
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+  box-shadow: 0 2px 8px rgba(239, 68, 68, 0.25);
+  transition: all 0.15s ease;
+}
+
+.btn-action-flow-delete:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 4px 12px rgba(239, 68, 68, 0.35);
+}
+
+/* Pagination Row */
+.chatbot-pagination-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 20px 24px;
+  background: #FFFFFF;
+  border-top: 1px solid #E5E7EB;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
+.info-badge-card {
+  border: 1px solid #E5E7EB;
+  padding: 8px 16px;
+  border-radius: 10px;
+  font-size: 12.5px;
+  color: #2563EB;
+  font-weight: 600;
+  background-color: #EFF6FF;
+}
+
+.pagination-btn-group {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.pagination-btn-cb {
+  border: 1px solid #E5E7EB;
+  background-color: #FFFFFF;
+  color: #475569;
+  padding: 8px 14px;
+  font-size: 13px;
+  font-weight: 600;
+  border-radius: 10px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.pagination-btn-cb:hover:not(:disabled) {
+  background-color: #F8FAFC;
+  color: #111827;
+  border-color: #CBD5E1;
+}
+
+.pagination-btn-cb.active {
+  background: linear-gradient(135deg, #a3e635, #15803d);
+  color: #FFFFFF;
+  border: none;
+  box-shadow: 0 2px 8px rgba(132, 204, 22, 0.25);
+}
+
+.pagination-btn-cb:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* Modals styles */
+.modal-overlay-cb {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background-color: rgba(15, 23, 42, 0.5);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+  backdrop-filter: blur(4px);
+}
+
+.modal-card-cb {
+  background: #FFFFFF;
+  border-radius: 20px;
+  width: 100%;
+  max-width: 520px;
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.15);
+  overflow: hidden;
+  animation: modalIn 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+@keyframes modalIn {
+  from {
+    opacity: 0;
+    transform: scale(0.95);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+.modal-header-cb {
+  padding: 20px 24px;
+  border-bottom: 1px solid #E5E7EB;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  background: #F8FAFC;
+}
+
+.modal-header-cb h2 {
+  font-size: 18px;
+  font-weight: 800;
+  color: #111827;
+  margin: 0;
+}
+
+.modal-close-btn-cb {
+  background: none;
+  border: none;
+  font-size: 22px;
+  color: #64748B;
+  cursor: pointer;
+  transition: color 0.15s ease;
+}
+
+.modal-close-btn-cb:hover {
+  color: #111827;
+}
+
+.modal-body-cb {
+  padding: 24px;
+}
+
+.form-group-cb {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 18px;
+}
+
+.form-group-cb label {
+  font-size: 13px;
+  font-weight: 700;
+  color: #374151;
+}
+
+.form-group-cb input,
+.form-group-cb textarea,
+.form-group-cb select {
+  border: 1px solid #E5E7EB;
+  padding: 12px 16px;
+  border-radius: 12px;
+  font-size: 14px;
+  outline: none;
+  background-color: #F8FAFC;
+  color: #111827;
+  font-family: inherit;
+  transition: all 0.2s ease;
+}
+
+.form-group-cb input:focus,
+.form-group-cb textarea:focus,
+.form-group-cb select:focus {
+  border-color: #2563EB;
+  background-color: #FFFFFF;
+  box-shadow: 0 0 0 4px rgba(37, 99, 235, 0.12);
+}
+
+.modal-footer-cb {
+  padding: 16px 24px;
+  background-color: #F8FAFC;
+  border-top: 1px solid #E5E7EB;
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+}
+
+.btn-modal-cancel-cb {
+  background-color: #FFFFFF;
+  color: #374151;
+  border: 1px solid #D1D5DB;
+  border-radius: 10px;
+  padding: 10px 18px;
+  font-size: 13.5px;
+  font-weight: 700;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.btn-modal-cancel-cb:hover {
+  background-color: #F3F4F6;
+}
+
+.btn-modal-save-cb {
+  background: linear-gradient(135deg, #10B981, #059669);
+  color: #FFFFFF;
+  border: none;
+  border-radius: 10px;
+  padding: 10px 22px;
+  font-size: 13.5px;
+  font-weight: 700;
+  cursor: pointer;
+  box-shadow: 0 4px 12px rgba(16, 185, 129, 0.25);
+  transition: all 0.15s ease;
+}
+
+.btn-modal-save-cb:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 6px 16px rgba(16, 185, 129, 0.35);
+}
+
+/* ─── Customer / Organization column (Super Admin view) ──────────────── */
+
+.flow-customer-cell {
+  vertical-align: middle;
+  padding: 10px 12px;
+  min-width: 160px;
+}
+
+.flow-org-name {
+  font-size: 12.5px;
+  font-weight: 700;
+  color: #1e293b;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 180px;
+}
+
+.flow-wa-phone-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  margin-top: 4px;
+  background: linear-gradient(135deg, #d1fae5, #a7f3d0);
+  color: #065f46;
+  border: 1px solid #6ee7b7;
+  border-radius: 20px;
+  padding: 2px 9px;
+  font-size: 11px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.flow-wa-biz-name {
+  margin-top: 3px;
+  font-size: 11px;
+  color: #64748b;
+  font-style: italic;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 180px;
+}
+
+/* ─── Keyword Chips & Badges in Flow Tables ────────────────── */
+.keyword-chips-wrap {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+  max-width: 360px;
+}
+
+.kw-chip {
+  display: inline-flex;
+  align-items: center;
+  background: #eff6ff;
+  color: #1d4ed8;
+  border: 1px solid #bfdbfe;
+  padding: 3px 10px;
+  border-radius: 9999px;
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.3;
+  letter-spacing: 0.01em;
+  white-space: nowrap;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04);
+  transition: all 0.15s ease;
+}
+
+.kw-chip:hover {
+  background: #dbeafe;
+  border-color: #93c5fd;
+  color: #1e40af;
+}
+
+.no-kw-text {
+  color: #94a3b8;
+  font-size: 12px;
+  font-style: italic;
+}

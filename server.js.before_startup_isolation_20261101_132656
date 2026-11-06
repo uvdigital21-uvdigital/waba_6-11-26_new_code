@@ -1,0 +1,226 @@
+import { markStaleResendJobs } from './src/services/campaignResendService.js';
+// ─────────────────────────────────────────────────────────────────────────────
+// server.js  —  Application entry point
+// ─────────────────────────────────────────────────────────────────────────────
+
+import express from 'express';
+import http from 'http';
+import cors from 'cors';
+import helmet from 'helmet';
+import morgan from 'morgan';
+import dotenv from 'dotenv';
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+// ── Load environment variables FIRST ──────────────────────────────────────────
+dotenv.config({ path: path.join(__dirname, '.env') });
+dotenv.config();
+
+// ── Never let a stray error silently kill the process (and every running campaign) ──
+process.on('unhandledRejection', (e) => console.error('[unhandledRejection]', e));
+process.on('uncaughtException', (e) => console.error('[uncaughtException]', e));
+
+import { initSocket } from './src/utils/socket.js';
+import { runMultitenantMigrations } from './src/db/migrateAndSeed.js';
+import { initScheduler } from './src/services/schedulerService.js';
+import { startBirthdayScheduler } from './src/services/birthdaySchedulerService.js';
+import { initFollowupScheduler } from './src/services/followupScheduler.js';
+
+// ── Routes ─────────────────────────────────────────────────────────────────────
+import authRoutes from './src/routes/authRoutes.js';
+import followupRoutes from './src/routes/followupRoutes.js';
+import userRoutes from './src/routes/userRoutes.js';
+import organizationRoutes from './src/routes/organizationRoutes.js';
+import resellerRoutes from './src/routes/resellerRoutes.js';
+import whatsappAccountRoutes from './src/routes/whatsappAccountRoutes.js';
+import permissionRoutes from './src/routes/permissionRoutes.js';
+import dashboardRoutes from './src/routes/dashboardRoutes.js';
+
+import agentRoutes from './src/routes/agentRoutes.js';
+import agentReportRoutes from './src/routes/agentReportRoutes.js';
+import chatRoutes from './src/routes/chatRoutes.js';
+import templateRoutes from './src/routes/templateRoutes.js';
+import blacklistRoutes from './src/routes/blacklistRoutes.js';
+import tagRoutes from './src/routes/tagRoutes.js';
+import creditRoutes from './src/routes/creditRoutes.js';
+import teamMemberRoutes from './src/routes/teamMemberRoutes.js';
+
+import webhookRoutes from './src/routes/webhook.js';
+import messageRoutes from './src/routes/message.js';
+import metaTemplateRoutes from './src/routes/metaTemplate.js';
+import chatbotRoutes from './src/routes/chatbotRoutes.js';
+import developerApiRoutes from './src/routes/developerApiRoutes.js';
+import catalogRoutes from './src/routes/catalogRoutes.js';
+import metaBillingRoutes from './src/routes/metaBillingRoutes.js';
+
+import requestLogger from './src/middleware/requestLogger.js';
+import errorHandler from './src/middleware/errorHandler.js';
+
+// ─────────────────────────────────────────────────────────────────────────────
+const app = express();
+
+// Serve uploaded files statically (both on /uploads and /api/uploads for reverse proxies)
+const uploadsPaths = [
+  path.join(__dirname, 'uploads'),
+  path.join(__dirname, '../uploads'),
+  path.join(process.cwd(), 'uploads'),
+  path.join(process.cwd(), 'backend', 'uploads')
+];
+
+uploadsPaths.forEach(p => {
+  if (fs.existsSync(p)) {
+    app.use('/uploads', express.static(p));
+    app.use('/api/uploads', express.static(p));
+  }
+});
+
+// Do not substitute a different image when an uploaded file is missing. A 404
+// lets the UI show an honest missing-media state instead of a misleading image.
+app.get(['/uploads/*', '/api/uploads/*'], (req, res) => {
+  res.status(404).json({ success: false, message: 'Uploaded media file not found.' });
+});
+
+// ── Security & Parsing ────────────────────────────────────────────────────────
+app.use(helmet({ contentSecurityPolicy: false }));
+app.use(cors({
+  origin: (origin, callback) => callback(null, true),
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'X-Account-ID', 'x-account-id', 'X-Device-ID', 'x-device-id', 'X-Reseller-Filter', 'x-reseller-filter', 'Accept', 'Origin']
+}));
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ extended: true, limit: '50mb' }));
+
+// ── HTTP request logging ──────────────────────────────────────────────────────
+app.use(morgan('dev'));
+app.use(requestLogger);
+
+// ── Health check ──────────────────────────────────────────────────────────────
+
+// Public calling page for chatbot HTTPS URL buttons.
+// No Meta template required; user explicitly taps to open phone dialer.
+app.get('/api/call', (req, res) => {
+  const phone = String(req.query.phone || '').replace(/[^0-9]/g, '');
+
+  if (!/^[1-9][0-9]{7,14}$/.test(phone)) {
+    return res.status(400).send('Invalid phone number');
+  }
+
+  res.set('Cache-Control', 'no-store');
+  res.set('Content-Type', 'text/html; charset=utf-8');
+
+  return res.send(`<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Call Now</title>
+<style>
+body{margin:0;font-family:Arial,sans-serif;background:#f4f8f6;display:flex;align-items:center;justify-content:center;min-height:100vh}
+.card{background:white;padding:35px 25px;text-align:center;border-radius:18px;box-shadow:0 8px 30px #0001;width:min(360px,85%)}
+h2{color:#075e54}
+.number{font-size:23px;margin:25px 0;font-weight:bold}
+.btn{display:block;background:#16a34a;color:white;text-decoration:none;padding:16px;border-radius:10px;font-weight:bold}
+p{color:#777;font-size:13px}
+</style>
+</head>
+<body>
+<div class="card">
+<h2>Call Now</h2>
+<div class="number">+${phone}</div>
+<a class="btn" href="tel:+${phone}">📞 Call Now</a>
+<p>Tap the button to open your phone dialer.</p>
+</div>
+</body>
+</html>`);
+});
+
+app.get('/api/health', (req, res) => res.json({ status: 'ok', timestamp: new Date().toISOString() }));
+
+// ── SaaS & Multi-Tenant Core Routes ───────────────────────────────────────────
+app.use('/api/auth', authRoutes);
+app.use('/api/followups', followupRoutes);
+app.use('/api/users', userRoutes);
+app.use('/api/resellers', resellerRoutes);
+app.use('/api/organizations', organizationRoutes);
+app.use('/api/whatsapp', whatsappAccountRoutes);
+app.use('/api/whatsapp-accounts', whatsappAccountRoutes);
+app.use('/api/numbers', whatsappAccountRoutes);
+app.use('/api/permissions', permissionRoutes);
+app.use('/api/dashboard', dashboardRoutes);
+
+// ── Operational Routes ────────────────────────────────────────────────────────
+app.use('/api/agents', agentRoutes);
+app.use('/api/agent-reports', agentReportRoutes);
+app.use('/api/chat', chatRoutes);
+app.use('/api/templates', templateRoutes);
+app.use('/api/blacklist', blacklistRoutes);
+app.use('/api/tags', tagRoutes);
+app.use('/api/credits', creditRoutes);
+app.use('/api/team-members', teamMemberRoutes);
+app.use('/api/chatbot', chatbotRoutes);
+app.use('/api/catalogs', catalogRoutes);
+app.use('/api', developerApiRoutes);
+
+// ── WhatsApp Webhook & Messaging ──────────────────────────────────────────────
+app.use('/webhook', webhookRoutes);
+app.use('/api/webhook', webhookRoutes);
+app.use('/api', messageRoutes);
+app.use('/api/meta-templates', metaTemplateRoutes);
+app.use('/api/meta/templates', metaTemplateRoutes);
+app.use('/api/meta', metaBillingRoutes);
+
+app.use(errorHandler);
+
+const server = http.createServer(app);
+initSocket(server);
+
+const PORT = process.env.PORT || 5000;
+
+server.listen(PORT, async () => {
+  console.log(`\n🚀 Server running on port ${PORT}`);
+  console.log(`================================================================================`);
+  console.log(`  [WEBHOOK CONFIGURATION & PUBLIC ACCESS GUIDE]`);
+  console.log(`  Backend Local Port: ${PORT}`);
+  console.log(`  Canonical Public Webhook Endpoint: POST /webhook`);
+  console.log(``);
+  console.log(`  To make your local backend reachable by Meta:`);
+  console.log(`    1. Run terminal command: ngrok http ${PORT}`);
+  console.log(`    2. Copy generated HTTPS URL: https://<NGROK-SUBDOMAIN>.ngrok-free.app/webhook`);
+  console.log(`    3. In Meta Developer Portal -> WhatsApp -> Configuration -> Edit Webhook:`);
+  console.log(`       - Callback URL: https://<NGROK-SUBDOMAIN>.ngrok-free.app/webhook`);
+  console.log(`       - Verify Token: my_super_secret_verify_token_2024`);
+  console.log(`    4. Ensure "messages" field checkbox is SUBSCRIBED.`);
+  console.log(`================================================================================\n`);
+
+  // Execute database migrations & seeders on startup
+  try {
+    await runMultitenantMigrations();
+  } catch (mErr) {
+    console.error('Migration startup error:', mErr);
+  }
+
+  // Initialize background campaign & birthday schedulers
+  try {
+    await initScheduler();
+
+    // Mark abandoned resend jobs as interrupted; never auto-resend.
+    await markStaleResendJobs();
+
+    startBirthdayScheduler();
+  } catch (schedErr) {
+    console.error('Campaign/Birthday scheduler startup error:', schedErr);
+  }
+
+  try {
+    initFollowupScheduler();
+  } catch (followupSchedErr) {
+    console.error('Follow-up scheduler startup error:', followupSchedErr);
+  }
+});
+
+export default app;

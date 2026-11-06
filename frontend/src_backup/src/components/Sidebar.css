@@ -1,0 +1,247 @@
+/* ============ SIDEBAR ============ */
+.sidebar {
+    width: 260px;
+    background: #ffffff;
+    border-right: 1px solid #e6e8ef;
+    display: flex;
+    flex-direction: column;
+    transition: width 0.2s ease;
+    flex-shrink: 0;
+    height: 100vh;
+}
+
+.sidebar.collapsed {
+    width: 72px;
+}
+
+.sidebar-brand {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 20px 16px;
+    border-bottom: 1px solid #eef0f6;
+    white-space: nowrap;
+    overflow: hidden;
+}
+
+.sidebar-brand .logo-dot {
+    width: 34px;
+    height: 34px;
+    min-width: 34px;
+    border-radius: 9px;
+    background: linear-gradient(135deg, #1abc9c, #16a596);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: #fff;
+    font-weight: 700;
+}
+
+.sidebar-brand span {
+    font-weight: 700;
+    font-size: 16px;
+    color: #262b3d;
+}
+
+.sidebar-nav {
+    flex: 1;
+    padding: 12px 12px;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+.nav-item {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 12px 16px;
+    border-radius: 10px;
+    color: #4A4A68;
+    font-size: 14px;
+    font-weight: 600;
+    text-decoration: none;
+    margin-bottom: 4px;
+    white-space: nowrap;
+    overflow: hidden;
+    transition: all 0.2s ease;
+}
+
+.nav-item svg {
+    min-width: 20px;
+    color: #3b5998;
+}
+
+.nav-item:hover {
+    background: #f2f4fb;
+    color: #1f2937;
+    transform: translateY(1px);
+}
+
+.nav-item.active {
+    background: #EEF4FF;
+    color: #4F6EF7;
+}
+
+.sidebar.collapsed .nav-item span,
+.sidebar.collapsed .sidebar-brand span {
+    display: none;
+}
+
+.sidebar.collapsed .nav-item {
+    justify-content: center;
+    padding: 12px;
+}
+
+.sidebar-foot {
+    padding: 14px 18px;
+    font-size: 11px;
+    color: #b0b3c4;
+    border-top: 1px solid #eef0f6;
+    white-space: nowrap;
+    overflow: hidden;
+}
+
+.nav-item-dropdown {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+}
+
+.dropdown-toggle {
+    width: 100%;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 12px 16px;
+    border-radius: 10px;
+    color: #4A4A68;
+    font-size: 14px;
+    font-weight: 600;
+    text-align: left;
+    margin-bottom: 4px;
+    white-space: nowrap;
+    overflow: hidden;
+    background: transparent;
+    border: none;
+    cursor: pointer;
+    transition: all 0.2s ease;
+    font-family: 'Poppins', sans-serif;
+}
+
+.dropdown-toggle svg:not(.dropdown-arrow) {
+    color: #3b5998;
+}
+
+.dropdown-toggle:hover {
+    background: #f2f4fb;
+    color: #1f2937;
+    transform: translateY(1px);
+}
+
+.dropdown-toggle.active {
+    background: #EEF4FF;
+    color: #4F6EF7;
+}
+
+.dropdown-toggle.active svg:not(.dropdown-arrow) {
+    color: #4F6EF7;
+}
+
+.dropdown-arrow {
+    margin-left: auto;
+    transition: transform 0.25s ease;
+    color: #4A4A68;
+    flex-shrink: 0;
+}
+
+.dropdown-toggle.active .dropdown-arrow {
+    transform: rotate(180deg);
+}
+
+.dropdown-menu {
+    max-height: 0;
+    opacity: 0;
+    overflow: hidden;
+    transition: max-height .3s ease, opacity .25s ease;
+    pointer-events: none;
+    z-index: 50;
+}
+
+.dropdown-menu.open {
+    max-height: 600px;
+    opacity: 1;
+    pointer-events: auto;
+}
+
+.dropdown-item {
+    display: block;
+    padding: 0 16px 0 50px;
+    height: 38px;
+    line-height: 38px;
+    font-size: 14px;
+    font-weight: 400;
+    color: #70738C;
+    text-decoration: none;
+    white-space: nowrap;
+    transition: all 0.15s ease;
+    border: none;
+    background: transparent;
+    cursor: pointer;
+    margin: 2px 0;
+}
+
+.dropdown-item:hover {
+    color: #4F6EF7;
+    background: transparent;
+}
+
+.dropdown-item.active {
+    color: #4F6EF7;
+    background: transparent;
+}
+
+.sidebar.collapsed .nav-item-dropdown {
+    position: static;
+    pointer-events: auto;
+}
+
+.sidebar.collapsed .dropdown-menu {
+    position: static;
+    min-width: auto;
+    background: #ffffff;
+    border: none;
+    border-radius: 0;
+    box-shadow: none;
+    z-index: auto;
+}
+
+.sidebar.collapsed .dropdown-menu.open {
+    max-height: 500px;
+    opacity: 1;
+}
+
+.sidebar.collapsed .dropdown-item {
+    padding: 0 16px;
+    text-align: center;
+}
+
+/* Submenu scrollable */
+.nav-item-dropdown .dropdown-menu {
+    max-height: 400px;
+    overflow-y: auto;
+}
+
+@media (max-width: 720px) {
+    .sidebar {
+        position: fixed;
+        z-index: 20;
+        height: 100vh;
+    }
+
+    .sidebar.collapsed {
+        width: 0;
+        overflow: hidden;
+    }
+}

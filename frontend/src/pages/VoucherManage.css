@@ -1,0 +1,332 @@
+/* Voucher Master (Voucher Manage) Stylesheet */
+
+.voucher-page {
+  padding: 24px;
+  background-color: #f8fafc;
+  font-family: 'Segoe UI', Roboto, sans-serif;
+}
+
+.voucher-card {
+  background: #ffffff;
+  border-radius: 8px;
+  border: 1px solid #e6e8ef;
+  box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.02);
+  padding: 24px;
+  margin-bottom: 24px;
+}
+
+/* Header Row matching Screenshot 1 */
+.vch-header-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 24px;
+  border-bottom: 1px solid #f1f5f9;
+  padding-bottom: 16px;
+  flex-wrap: wrap;
+  gap: 16px;
+}
+
+.vch-header-left {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.vch-avatar-icon {
+  background-color: #e0f2fe;
+  color: #0284c7;
+  width: 38px;
+  height: 38px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.vch-header-title {
+  font-size: 20px;
+  font-weight: 700;
+  color: #1e293b;
+  margin: 0;
+}
+
+.btn-generate-vch,
+.btn-redeem-vch-trigger {
+  border: none;
+  border-radius: 6px;
+  padding: 8px 16px;
+  font-size: 13px;
+  font-weight: 600;
+  color: #ffffff;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  background-color: #1abc9c;
+  box-shadow: 0 4px 6px -1px rgba(26, 188, 156, 0.2);
+}
+
+.btn-generate-vch:hover,
+.btn-redeem-vch-trigger:hover {
+  background-color: #16a085;
+}
+
+.vch-header-center {
+  flex: 1;
+  display: flex;
+  justify-content: center;
+}
+
+@media (max-width: 768px) {
+  .vch-header-center {
+    justify-content: flex-start;
+    margin-top: 8px;
+  }
+}
+
+.btn-redeem-vch-trigger {
+  padding: 10px 32px;
+  font-size: 14px;
+}
+
+.vch-header-right select {
+  border: 1px solid #cbd5e1;
+  padding: 8px 16px;
+  border-radius: 6px;
+  font-size: 13.5px;
+  background-color: #ffffff;
+  color: #334155;
+  outline: none;
+  min-width: 180px;
+}
+
+/* Sub filters controls bar */
+.vch-sub-filters {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 16px;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
+.vch-entries-select {
+  font-size: 13px;
+  color: #64748b;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.vch-entries-select select {
+  border: 1px solid #cbd5e1;
+  padding: 6px 10px;
+  border-radius: 6px;
+  outline: none;
+  font-size: 13px;
+  background-color: #ffffff;
+  color: #334155;
+}
+
+.vch-date-badge {
+  background-color: #1abc9c;
+  color: #ffffff;
+  font-size: 12.5px;
+  font-weight: 600;
+  padding: 8px 16px;
+  border-radius: 6px;
+  user-select: none;
+  box-shadow: 0 2px 4px rgba(26, 188, 156, 0.15);
+}
+
+/* Table layout styling */
+.vch-table-container {
+  overflow-x: auto;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  margin-bottom: 16px;
+}
+
+.vch-data-table {
+  width: 100%;
+  border-collapse: collapse;
+  text-align: left;
+  font-size: 13px;
+}
+
+.vch-data-table th {
+  background-color: #1abc9c;
+  color: #ffffff;
+  font-weight: 600;
+  padding: 12px 16px;
+  border-bottom: 1px solid #16a085;
+  border-right: 1px solid rgba(255,255,255,0.25);
+  white-space: nowrap;
+}
+
+.vch-data-table th:last-child {
+  border-right: none;
+}
+
+.vch-data-table td {
+  padding: 12px 16px;
+  border-bottom: 1px solid #e2e8f0;
+  border-right: 1px solid #e8eaf0;
+  color: #334155;
+  vertical-align: middle;
+}
+
+.vch-data-table td:last-child {
+  border-right: none;
+}
+
+.vch-data-table tbody tr:hover {
+  background-color: #f8fafc;
+}
+
+.vch-empty-row {
+  text-align: center;
+  color: #64748b;
+  font-style: italic;
+  padding: 32px !important;
+}
+
+/* Status cell tags */
+.vch-badge-pending {
+  background-color: #fef3c7;
+  color: #d97706;
+  padding: 2px 8px;
+  border-radius: 4px;
+  font-size: 11px;
+  font-weight: 700;
+  border: 1px solid #fde68a;
+}
+
+.vch-badge-redeemed {
+  background-color: #e6fcf5;
+  color: #0ca678;
+  padding: 2px 8px;
+  border-radius: 4px;
+  font-size: 11px;
+  font-weight: 700;
+  border: 1px solid #c3fae8;
+}
+
+/* Pagination Footer */
+.vch-table-footer {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
+.vch-showing-entries {
+  font-size: 13px;
+  color: #3b82f6;
+  border: 1px solid #dbeafe;
+  background-color: #eff6ff;
+  padding: 6px 12px;
+  border-radius: 6px;
+}
+
+.vch-pagination {
+  display: flex;
+  gap: 4px;
+}
+
+.btn-vch-pag {
+  border: 1px solid #cbd5e1;
+  background-color: #ffffff;
+  color: #475569;
+  padding: 6px 12px;
+  font-size: 12.5px;
+  font-weight: 600;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.btn-vch-pag:hover:not(:disabled) {
+  background-color: #f1f5f9;
+  border-color: #94a3b8;
+}
+
+.btn-vch-pag.active {
+  background-color: #3b82f6;
+  color: #ffffff;
+  border-color: #3b82f6;
+}
+
+.btn-vch-pag:disabled {
+  background-color: #f8fafc;
+  color: #cbd5e1;
+  cursor: not-allowed;
+}
+
+/* Modals overlays & form headers matching Screenshot 2/3 */
+.vch-modal-card-header {
+  padding: 20px 24px;
+  border-bottom: 1px solid #f1f5f9;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  background-color: #ffffff;
+}
+
+.vch-modal-card-title {
+  font-size: 19px;
+  font-weight: 700;
+  color: #334155;
+  margin: 0;
+}
+
+.vch-modal-body {
+  padding: 24px;
+  background-color: #ffffff;
+}
+
+.vch-modal-label {
+  display: block;
+  font-size: 14.5px;
+  font-weight: 600;
+  color: #334155;
+  margin-bottom: 8px;
+}
+
+.vch-modal-input,
+.vch-modal-select {
+  border: 1px solid #cbd5e1;
+  padding: 10px 14px;
+  border-radius: 6px;
+  font-size: 13.5px;
+  outline: none;
+  background-color: #ffffff;
+  color: #1e293b;
+  width: 100%;
+  margin-bottom: 20px;
+}
+
+.vch-modal-input:focus,
+.vch-modal-select:focus {
+  border-color: #3b82f6;
+}
+
+/* Modal Actions */
+.btn-vch-cancel {
+  background-color: #f1f5f9;
+  color: #475569;
+}
+
+.btn-vch-cancel:hover {
+  background-color: #e2e8f0;
+}
+
+.btn-vch-submit {
+  background-color: #3b82f6;
+  color: #ffffff;
+  box-shadow: 0 4px 6px -1px rgba(59, 130, 246, 0.2);
+}
+
+.btn-vch-submit:hover {
+  background-color: #2563eb;
+}

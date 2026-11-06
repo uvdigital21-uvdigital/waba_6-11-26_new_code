@@ -1,0 +1,28 @@
+# Dependencies
+node_modules/
+frontend/node_modules/
+
+# Environment files & secrets
+.env
+.env.*
+!.env.example
+frontend/.env
+frontend/.env.*
+!frontend/.env.example
+
+# Large archives and database backups
+*.zip
+*.tar
+*.tar.gz
+*.sql
+*.bak
+
+# Builds & logs
+dist/
+frontend/dist/
+logs/
+*.log
+
+# Media uploads
+uploads/
+frontend/public/uploads/

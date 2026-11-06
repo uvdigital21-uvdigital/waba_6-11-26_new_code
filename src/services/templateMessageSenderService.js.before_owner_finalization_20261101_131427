@@ -1,0 +1,1760 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// src/services/templateMessageSenderService.js  (FIXED VERSION + CAMPAIGN LOOP FIX)
+// Single Authoritative Central Template Sender Service for all modules:
+// - Quick Broadcast
+// - Upload CSV Campaign
+// - Segment by Tags
+// - Segment by Group
+// - Birthday Automation
+// - Scheduled Campaigns
+// - Developer API / Chatbot
+//
+// CHANGES vs previous version:
+// sendCentralCampaignBatch() was rewritten so a campaign can never get stuck:
+//  - no long-held DB connection (each query uses its own short pool connection)
+//  - every number is wrapped in its own try/catch (one bad number != dead campaign)
+//  - post-send bookkeeping (credit / chat record) can no longer flip a sent
+//    message to "failed"
+//  - campaign status is ALWAYS finalised in `finally` (completed/failed/interrupted)
+//  - sent/failed counts are synced from real campaign_recipients rows every 20
+//    messages and at the end
+//  - RESUME support: numbers that already have a campaign_recipients row are skipped
+// ─────────────────────────────────────────────────────────────────────────────
+
+import axios from 'axios';
+import fs from 'fs';
+import path from 'path';
+import FormData from 'form-data';
+import sharp from 'sharp';
+import { fileURLToPath } from 'url';
+import { pool } from '../config/db.js';
+import whatsappConfig from '../config/whatsapp.js';
+import logger from '../utils/logger.js';
+import { decryptToken } from '../utils/encryption.js';
+import { getTemplateDetails } from './templateService.js';
+import { checkBlacklist } from './blacklistService.js';
+import { hasSufficientCredits, deductMessageCredit } from './creditService.js';
+import { recordChatMessage } from './chatService.js';
+import { emitToOrganization } from '../utils/socket.js';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+/**
+ * Detects real mime type from file magic bytes. Falls back to extension-based
+ * guess if the signature isn't recognized. This avoids Meta rejecting media
+ * because the declared Content-Type doesn't match the actual file bytes.
+ */
+function detectMimeFromBuffer(buffer, fallbackExt = '.png') {
+  if (!buffer || buffer.length < 12) return extToMime(fallbackExt);
+  const hex = buffer.subarray(0, 12).toString('hex');
+
+  if (hex.startsWith('89504e47')) return 'image/png';
+  if (hex.startsWith('ffd8ff')) return 'image/jpeg';
+  if (hex.startsWith('52494646') && buffer.subarray(8, 12).toString('ascii') === 'WEBP') return 'image/webp';
+  if (hex.startsWith('66747970') || buffer.subarray(4, 8).toString('ascii') === 'ftyp') return 'video/mp4';
+  if (hex.startsWith('25504446')) return 'application/pdf';
+  if (hex.startsWith('1a45dfa3')) return 'video/webm';
+
+  return extToMime(fallbackExt);
+}
+
+function extToMime(ext) {
+  const e = (ext || '').toLowerCase();
+  if (e === '.jpg' || e === '.jpeg') return 'image/jpeg';
+  if (e === '.png') return 'image/png';
+  if (e === '.webp') return 'image/webp';
+  if (e === '.mp4') return 'video/mp4';
+  if (e === '.pdf') return 'application/pdf';
+  return 'application/octet-stream';
+}
+
+/**
+ * Sanitizes an image buffer into a WhatsApp-safe baseline sRGB JPEG.
+ *
+ * WHY THIS EXISTS: Meta's /media upload endpoint happily ACCEPTS images that
+ * are technically valid JPEG/PNG bytes but that the WhatsApp delivery
+ * pipeline later chokes on at send time — most commonly:
+ *   - CMYK colorspace JPEGs (very common from Photoshop/Canva/print-oriented
+ *     exports) instead of RGB
+ *   - Progressive/interlaced JPEGs
+ *   - Images carrying an EXIF orientation flag that rotates unexpectedly
+ *   - Unusual/embedded ICC color profiles
+ * These all upload "successfully" (media_id returned) but then fail
+ * asynchronously via webhook with "131053: Media upload error" once Meta
+ * actually tries to process/deliver the media. Converting every header
+ * image to a plain baseline sRGB JPEG before upload eliminates this class
+ * of failure entirely.
+ */
+async function sanitizeImageForWhatsApp(buffer, mimeType) {
+  // Only touch images — videos and PDFs pass through untouched.
+  if (!mimeType || !mimeType.startsWith('image/')) return { buffer, mimeType, sanitized: false };
+
+  try {
+    const sanitized = await sharp(buffer)
+      .rotate()                 // apply EXIF orientation, then EXIF is dropped on output
+      .toColourspace('srgb')    // force RGB — fixes the CMYK case
+      .jpeg({ quality: 92, progressive: false, chromaSubsampling: '4:2:0' }) // baseline, non-progressive
+      .toBuffer();
+    logger.info(`[CentralTemplateSender] Image sanitized for WhatsApp (${buffer.length} -> ${sanitized.length} bytes, forced sRGB baseline JPEG)`);
+    return { buffer: sanitized, mimeType: 'image/jpeg', sanitized: true };
+  } catch (err) {
+    logger.warn(`[CentralTemplateSender] Image sanitization failed (${err.message}) — falling back to original buffer.`);
+    return { buffer, mimeType, sanitized: false };
+  }
+}
+
+/**
+ * Resolves multi-tenant Meta credentials for a specific organization/account.
+ */
+export async function resolveAccountCredentials(accountId = null, organizationId = null) {
+  let targetPhoneId = null;
+  let targetToken = null;
+  let targetWabaId = null;
+  let status = 'Active';
+  let resolvedOrgId = organizationId;
+  let resolvedAccountId = accountId;
+
+  try {
+    let rows = [];
+    if (accountId) {
+      let query = 'SELECT id, phone_number_id, access_token, waba_id, status, organization_id FROM whatsapp_accounts WHERE id = ?';
+      const params = [accountId];
+      if (organizationId) {
+        query += ' AND organization_id = ?';
+        params.push(organizationId);
+      }
+      const [accRows] = await pool.query(query, params);
+      rows = accRows;
+    }
+
+    if (rows.length === 0 && accountId) {
+      throw new Error(`WhatsApp account ${accountId} not found for organization ${organizationId}`);
+    }
+
+    if (rows.length === 0 && organizationId) {
+      const [accRows] = await pool.query(
+        'SELECT id, phone_number_id, access_token, waba_id, status, organization_id FROM whatsapp_accounts WHERE organization_id = ? ORDER BY (status = "Active") DESC, id DESC LIMIT 1',
+        [organizationId]
+      );
+      rows = accRows;
+    } else if (rows.length === 0) {
+      const [accRows] = await pool.query(
+        'SELECT id, phone_number_id, access_token, waba_id, status, organization_id FROM whatsapp_accounts ORDER BY id DESC LIMIT 1'
+      );
+      rows = accRows;
+    }
+
+    if (rows.length > 0) {
+      const acc = rows[0];
+      resolvedAccountId = acc.id;
+      resolvedOrgId = acc.organization_id || resolvedOrgId;
+      if (acc.phone_number_id) targetPhoneId = acc.phone_number_id;
+      if (acc.waba_id) targetWabaId = acc.waba_id;
+      if (acc.access_token) targetToken = decryptToken(acc.access_token);
+      status = acc.status || 'Active';
+    }
+  } catch (err) {
+    logger.warn(`[CentralTemplateSender] Error fetching credentials for acc=${accountId}, org=${organizationId}: ${err.message}`);
+  }
+
+  // Never substitute another account's Meta credentials for a tenant send.
+  if (accountId || organizationId) {
+    if (!targetPhoneId || !targetToken || !targetWabaId) {
+      throw new Error(
+        `[CentralTemplateSender] Missing tenant WhatsApp credentials: account=${accountId}, organization=${organizationId}`
+      );
+    }
+  } else {
+    // Legacy system-level calls without tenant context.
+    if (!targetPhoneId) targetPhoneId = whatsappConfig.phoneNumberId;
+    if (!targetToken) targetToken = whatsappConfig.accessToken;
+    if (!targetWabaId) targetWabaId = whatsappConfig.wabaId;
+  }
+
+  return {
+    phoneId: targetPhoneId,
+    token: targetToken,
+    wabaId: targetWabaId,
+    status,
+    organizationId: resolvedOrgId,
+    accountId: resolvedAccountId
+  };
+}
+
+/**
+ * Uploads a local file buffer to Meta Cloud API (/v19.0/${phoneId}/media)
+ * to receive a valid runtime WhatsApp Media ID.
+ *
+ * FIXED: now returns { id, error } instead of swallowing the real Meta
+ * error and returning a bare null. Callers can inspect `error` to know
+ * EXACTLY why upload failed (invalid token, wrong phone_number_id scope,
+ * unsupported mime, file too large, network timeout, etc).
+ */
+export async function uploadMediaToMeta(fileBuffer, mimeType = 'image/png', fileName = 'sample.png', phoneNumberId = null, accessToken = null) {
+  const pId = phoneNumberId || whatsappConfig.phoneNumberId;
+  const token = accessToken || whatsappConfig.accessToken;
+  const apiVersion = whatsappConfig.apiVersion || 'v19.0';
+
+  if (!pId || !token) {
+    const msg = 'Missing phoneNumberId or accessToken for Meta media upload.';
+    logger.error(`[CentralTemplateSender] ${msg}`);
+    return { id: null, error: msg };
+  }
+
+  if (!fileBuffer || fileBuffer.length === 0) {
+    const msg = 'Empty file buffer — nothing to upload to Meta.';
+    logger.error(`[CentralTemplateSender] ${msg}`);
+    return { id: null, error: msg };
+  }
+
+  try {
+    // Normalize video before every Meta media upload.
+    if (mimeType === 'video/mp4' || mimeType?.startsWith('video/')) {
+      const { execFileSync } = await import('node:child_process');
+      const os = await import('node:os');
+      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'waba-send-video-'));
+
+      try {
+        const input = path.join(tempDir, 'input.mp4');
+        const output = path.join(tempDir, 'output.mp4');
+        fs.writeFileSync(input, fileBuffer);
+
+        const probe = JSON.parse(execFileSync('ffprobe', [
+          '-v', 'error', '-show_streams', '-of', 'json', input
+        ], { timeout: 30000 }).toString());
+
+        const video = probe.streams?.find(x => x.codec_type === 'video');
+        const audios = probe.streams?.filter(x => x.codec_type === 'audio') || [];
+
+        if (!video) throw new Error('Invalid video: no video stream');
+
+        if (video.codec_name !== 'h264' ||
+            video.pix_fmt !== 'yuv420p' ||
+            audios.some(x => x.codec_name !== 'aac')) {
+          execFileSync('ffmpeg', [
+            '-hide_banner', '-loglevel', 'error', '-y',
+            '-i', input, '-map', '0:v:0', '-map', '0:a?',
+            '-c:v', 'libx264', '-preset', 'fast',
+            '-crf', '27', '-pix_fmt', 'yuv420p',
+            '-profile:v', 'main',
+            '-c:a', 'aac', '-b:a', '128k',
+            '-movflags', '+faststart', output
+          ], { timeout: 180000 });
+
+          fileBuffer = fs.readFileSync(output);
+          logger.info('[CentralTemplateSender] Video converted to H264/AAC');
+        }
+
+        if (fileBuffer.length > 16 * 1024 * 1024) {
+          throw new Error('Video exceeds 16 MB after processing');
+        }
+
+        mimeType = 'video/mp4';
+        fileName = path.parse(fileName || 'video').name + '.mp4';
+      } finally {
+        fs.rmSync(tempDir, { recursive: true, force: true });
+      }
+    }
+
+    const form = new FormData();
+    form.append('messaging_product', 'whatsapp');
+    form.append('file', fileBuffer, { filename: fileName, contentType: mimeType });
+
+    logger.info(`[CentralTemplateSender] Uploading media to Meta -> phoneId=${pId}, mime=${mimeType}, size=${fileBuffer.length} bytes, file=${fileName}`);
+
+    const res = await axios.post(`https://graph.facebook.com/${apiVersion}/${pId}/media`, form, {
+      headers: {
+        Authorization: `Bearer ${token}`,
+        ...form.getHeaders()
+      },
+      timeout: 25000
+    });
+
+    if (!res.data?.id) {
+      const msg = `Meta returned no media id: ${JSON.stringify(res.data)}`;
+      logger.error(`[CentralTemplateSender] ${msg}`);
+      return { id: null, error: msg };
+    }
+
+    logger.success?.(`[CentralTemplateSender] ✅ Meta media uploaded successfully. media_id=${res.data.id}`);
+    return { id: res.data.id, error: null };
+  } catch (err) {
+    // THIS is the part that was previously hidden. Log the FULL Meta error body.
+    const metaErr = err.response?.data?.error;
+    const detailedMsg = metaErr
+      ? `Meta media upload failed [code ${metaErr.code}/${metaErr.error_subcode || '-'}]: ${metaErr.message || metaErr.error_user_msg}`
+      : `Meta media upload failed: ${err.message}`;
+    logger.error(`[CentralTemplateSender] ${detailedMsg}`);
+    logger.error(`[CentralTemplateSender] Full Meta error payload: ${JSON.stringify(err.response?.data || {})}`);
+    return { id: null, error: detailedMsg };
+  }
+}
+
+/**
+ * Checks whether a URL is actually publicly reachable over HTTPS before we
+ * hand it to Meta as a header `link`. If Meta can't fetch it (auth wall,
+ * wrong domain, 404, blocked by firewall/CDN), it fails with a generic
+ * "131053: Media upload error" — this check catches that BEFORE sending.
+ */
+async function isPubliclyReachable(url) {
+  if (!url || !/^https:\/\//i.test(url)) return false;
+  try {
+    const res = await axios.head(url, { timeout: 8000, validateStatus: () => true });
+    if (res.status >= 200 && res.status < 300) {
+      const ct = res.headers['content-type'] || '';
+      if (/^(image|video|application\/pdf)/i.test(ct)) return true;
+      logger.warn(`[CentralTemplateSender] URL reachable but unexpected content-type "${ct}" for ${url}`);
+      return false;
+    }
+    logger.warn(`[CentralTemplateSender] Public media URL not reachable (HTTP ${res.status}): ${url}`);
+    return false;
+  } catch (err) {
+    logger.warn(`[CentralTemplateSender] Public media URL check failed for ${url}: ${err.message}`);
+    return false;
+  }
+}
+
+/**
+ * Resolves the template record from DB scoped by organization and template name/ID.
+ */
+export async function resolveTemplateRecord(templateName, templateId = null, organizationId = null) {
+  try {
+    let query = 'SELECT id, organization_id, template_name, header_media_url, original_filename, meta_header_handle, media_type, meta_template_id, language, category, buttons_json, meta_response FROM whatsapp_templates WHERE 1=1';
+    const params = [];
+
+    if (templateId) {
+      query += ' AND id = ?';
+      params.push(templateId);
+    } else if (templateName) {
+      query += ' AND template_name = ?';
+      params.push(templateName);
+    }
+
+    if (organizationId) {
+      query += ' AND (organization_id = ? OR organization_id IS NULL)';
+      params.push(organizationId);
+    }
+
+    query += ' ORDER BY (organization_id IS NOT NULL) DESC, id DESC LIMIT 1';
+
+    const [rows] = await pool.query(query, params);
+    if (rows.length > 0) {
+      return rows[0];
+    }
+
+    // Fallback query on templates table
+    if (templateName) {
+      const [tRows] = await pool.query('SELECT id, organization_id, name as template_name, header_media_url, meta_header_handle, language, category FROM templates WHERE name = ? ORDER BY id DESC LIMIT 1', [templateName]);
+      if (tRows.length > 0) {
+        return tRows[0];
+      }
+    }
+  } catch (err) {
+    logger.warn(`[CentralTemplateSender] Error querying template records: ${err.message}`);
+  }
+  return null;
+}
+
+/**
+ * Builds the runtime template components including header media upload, variables, and buttons.
+ */
+export async function buildCentralTemplateComponents({
+  templateName,
+  templateId = null,
+  languageCode = 'en_US',
+  organizationId = null,
+  phoneNumberId = null,
+  accessToken = null,
+  suppliedComponents = [],
+  variables = {},
+  customMediaUrl = null,
+  customCarouselMedia = null
+}) {
+  const finalComponents = Array.isArray(suppliedComponents) ? [...suppliedComponents] : [];
+  let mediaResolutionFailed = false;
+  let mediaResolutionError = null;
+
+  // 1. Resolve DB template record
+  const dbTemplate = await resolveTemplateRecord(templateName, templateId, organizationId);
+
+  // 2. Fetch Meta official template structure
+  let metaTemplate = null;
+  try {
+    metaTemplate = await getTemplateDetails(templateName, languageCode, null, organizationId);
+  } catch (err) {
+    logger.warn(`[CentralTemplateSender] Could not fetch Meta template details for "${templateName}": ${err.message}`);
+  }
+
+  const metaComponents = metaTemplate?.components || [];
+
+  // Helper to find file on disk — FIXED: now logs every path it tries.
+  const findFileOnDisk = (rawPath) => {
+    if (!rawPath || typeof rawPath !== 'string') return null;
+    const filename = path.basename(rawPath);
+    const cleanRel = rawPath.replace(/^\//, '');
+    const possiblePaths = [
+      path.resolve(process.cwd(), 'uploads/templates', filename),
+      path.resolve(process.cwd(), 'backend/backend/uploads/templates', filename),
+      path.resolve(process.cwd(), 'backend/uploads/templates', filename),
+      path.resolve(__dirname, '../../uploads/templates', filename),
+      path.resolve(__dirname, '../../../uploads/templates', filename),
+      path.resolve(__dirname, '../../../backend/backend/uploads/templates', filename),
+      path.resolve(__dirname, '../../', cleanRel),
+      path.resolve(process.cwd(), cleanRel)
+    ];
+    for (const p of possiblePaths) {
+      if (fs.existsSync(p)) {
+        logger.info(`[CentralTemplateSender] Found media file on disk: ${p}`);
+        return p;
+      }
+    }
+    logger.error(`[CentralTemplateSender] Media file "${rawPath}" NOT FOUND on disk. Tried:\n  ${possiblePaths.join('\n  ')}`);
+    return null;
+  };
+
+  const findTemplateMediaOnDisk = (name, originalFilename = null) => {
+    if (originalFilename) {
+      const exact = findFileOnDisk(originalFilename);
+      if (exact) return exact;
+    }
+    const normalize = value => String(value || '')
+      .toLowerCase()
+      .replace(/exisiting/g, 'existing')
+      .replace(/[^a-z0-9]+/g, '_')
+      .replace(/^_+|_+$/g, '');
+    const wanted = normalize(name);
+    const roots = [
+      path.resolve(process.cwd(), 'uploads/templates'),
+      path.resolve(process.cwd(), 'backend/uploads/templates'),
+      path.resolve(process.cwd(), 'backend/backend/uploads/templates'),
+      path.resolve(__dirname, '../../uploads/templates'),
+      path.resolve(__dirname, '../../../uploads/templates')
+    ];
+    for (const root of roots) {
+      if (!fs.existsSync(root)) continue;
+      const match = fs.readdirSync(root).find(file => {
+        const normalizedFile = normalize(path.basename(file, path.extname(file)))
+          .replace(/^template_/, '')
+          .replace(/_\d{10,}$/, '');
+        return normalizedFile === wanted;
+      });
+      if (match) {
+        const resolved = path.join(root, match);
+        logger.info(`[CentralTemplateSender] Matched legacy media for "${name}": ${resolved}`);
+        return resolved;
+      }
+    }
+    return null;
+  };
+
+  // 3. Resolve HEADER component (Image/Video/Document/Text)
+  const headerComp = metaComponents.find(c => (c.type || '').toUpperCase() === 'HEADER');
+  let existingHeader = finalComponents.find(c => (c.type || '').toLowerCase() === 'header');
+
+  // CRITICAL FIX: if the template's header is IMAGE/VIDEO/DOCUMENT, ALWAYS let
+  // the backend resolve + sanitize the media itself — even if the caller
+  // (Quick Broadcast frontend, Tag campaigns, chatbot, etc.) already built and
+  // supplied its own "header" component with a raw link/id.
+  //
+  // WHY: different frontend screens build their header parameter differently,
+  // and some pass a raw/un-sanitized media link or id directly. If we trust
+  // that supplied header, our sanitizeImageForWhatsApp() step (which fixes
+  // CMYK/progressive JPEGs — the actual cause of error 131053) never runs for
+  // those requests, so the same template can randomly work or fail depending
+  // on which screen/module triggered the send. Dropping any caller-supplied
+  // IMAGE/VIDEO/DOCUMENT header and always rebuilding it here makes every
+  // send path (Quick Broadcast, Tags, Groups, Scheduled, CSV, chatbot/API)
+  // go through the exact same sanitized media pipeline.
+  if (headerComp && existingHeader && ['IMAGE', 'VIDEO', 'DOCUMENT'].includes((headerComp.format || '').toUpperCase())) {
+    logger.info(`[CentralTemplateSender] Ignoring caller-supplied ${headerComp.format} header for "${templateName}" — backend will resolve & sanitize the media itself.`);
+    const idx = finalComponents.indexOf(existingHeader);
+    if (idx > -1) finalComponents.splice(idx, 1);
+    existingHeader = null;
+  }
+
+  if (headerComp && !existingHeader) {
+    const format = (headerComp.format || '').toUpperCase();
+    if (['IMAGE', 'VIDEO', 'DOCUMENT'].includes(format)) {
+      let mediaTarget = customMediaUrl
+        || (String(dbTemplate?.header_media_url || '').startsWith('/uploads/')
+            ? dbTemplate.header_media_url : null)
+        || dbTemplate?.original_filename
+        || findTemplateMediaOnDisk(templateName)
+        || dbTemplate?.header_media_url
+        || headerComp.example?.header_url?.[0]
+        || (String(headerComp.example?.header_handle?.[0] || '').startsWith('http') ? headerComp.example.header_handle[0] : null)
+        || null;
+      let runtimeMediaId = null;
+      let safeSingleLink = null;
+      let uploadErrorDetail = null;
+      const serverBaseUrl = (process.env.SERVER_BASE_URL || process.env.BASE_URL || 'https://officialwaba.com').replace(/\/$/, '');
+
+      if (mediaTarget && typeof mediaTarget === 'string') {
+        if (mediaTarget.startsWith('http://') || mediaTarget.startsWith('https://')) {
+          if (!mediaTarget.includes('lookaside.fbsbx.com') && !mediaTarget.includes('fbsbx.com') && !mediaTarget.includes('facebook.com')) {
+            safeSingleLink = mediaTarget;
+          }
+        } else if (mediaTarget.includes('uploads/')) {
+          const cleanRel = mediaTarget.replace(/^.*uploads\//, '');
+          safeSingleLink = `${serverBaseUrl}/api/uploads/${cleanRel}`;
+        }
+      }
+
+      // Handle Base64 Header Media
+      if (mediaTarget && typeof mediaTarget === 'string' && mediaTarget.startsWith('data:')) {
+        try {
+          const rawB64 = mediaTarget.replace(/^data:[A-Za-z0-9-+\/]+;base64,/, '');
+          const fileBuf = Buffer.from(rawB64, 'base64');
+          const mimeMatch = mediaTarget.match(/^data:([A-Za-z0-9-+\/]+);base64,/);
+          let mType = mimeMatch ? mimeMatch[1] : detectMimeFromBuffer(fileBuf, format === 'VIDEO' ? '.mp4' : format === 'DOCUMENT' ? '.pdf' : '.png');
+          const sanitizedResult = await sanitizeImageForWhatsApp(fileBuf, mType);
+          const uploadBuf = sanitizedResult.buffer;
+          mType = sanitizedResult.mimeType;
+          const ext = mType.includes('video') || mType.includes('mp4') ? '.mp4' : mType.includes('pdf') ? '.pdf' : '.jpg';
+          logger.info(`[CentralTemplateSender] Uploading base64 header media to Meta (${uploadBuf.length} bytes, type: ${mType})`);
+          const uploadResult = await uploadMediaToMeta(uploadBuf, mType, `header_${templateName}${ext}`, phoneNumberId, accessToken);
+          runtimeMediaId = uploadResult.id;
+          uploadErrorDetail = uploadResult.error;
+        } catch (bErr) {
+          logger.warn('[CentralTemplateSender] Base64 header media upload error:', bErr.message);
+          uploadErrorDetail = bErr.message;
+        }
+      } else if (mediaTarget && typeof mediaTarget === 'string' && !mediaTarget.startsWith('http://') && !mediaTarget.startsWith('https://')) {
+        // If local file exists, upload to Meta Media API
+        try {
+          const foundDiskPath = findFileOnDisk(mediaTarget);
+          if (foundDiskPath) {
+            const rawBuf = fs.readFileSync(foundDiskPath);
+            const ext = path.extname(foundDiskPath).toLowerCase();
+            const detectedMime = detectMimeFromBuffer(rawBuf, ext);
+            const sanitizedResult = await sanitizeImageForWhatsApp(rawBuf, detectedMime);
+            const fileBuf = sanitizedResult.buffer;
+            const mType = sanitizedResult.mimeType;
+            const uploadFileName = sanitizedResult.sanitized
+              ? path.basename(foundDiskPath, ext) + '.jpg'
+              : path.basename(foundDiskPath);
+            logger.info(`[CentralTemplateSender] Uploading template original media to Meta: ${foundDiskPath} (${fileBuf.length} bytes, mime: ${mType}, sanitized: ${sanitizedResult.sanitized})`);
+            const uploadResult = await uploadMediaToMeta(fileBuf, mType, uploadFileName, phoneNumberId, accessToken);
+            runtimeMediaId = uploadResult.id;
+            uploadErrorDetail = uploadResult.error;
+            if (runtimeMediaId) {
+              logger.success?.(`[CentralTemplateSender] Runtime Media ID obtained for "${templateName}": ${runtimeMediaId}`);
+            }
+          } else {
+            uploadErrorDetail = `Local media file "${mediaTarget}" could not be located on disk.`;
+          }
+        } catch (fErr) {
+          logger.warn('[CentralTemplateSender] Local media read/upload error:', fErr.message);
+          uploadErrorDetail = fErr.message;
+        }
+      } else if (safeSingleLink) {
+        // A stored public URL is only an input source. Download it, sanitize
+        // it, and upload to Meta; never pass the URL through to WhatsApp.
+        try {
+          const response = await axios.get(safeSingleLink, { responseType: 'arraybuffer', timeout: 15000 });
+          const rawBuf = Buffer.from(response.data);
+          const detectedMime = response.headers['content-type'] || detectMimeFromBuffer(rawBuf, format === 'VIDEO' ? '.mp4' : format === 'DOCUMENT' ? '.pdf' : '.jpg');
+          const sanitizedResult = await sanitizeImageForWhatsApp(rawBuf, detectedMime);
+          const extension = format === 'VIDEO' ? '.mp4' : format === 'DOCUMENT' ? '.pdf' : '.jpg';
+          const uploadResult = await uploadMediaToMeta(sanitizedResult.buffer, sanitizedResult.mimeType, `header_${templateName}${extension}`, phoneNumberId, accessToken);
+          runtimeMediaId = uploadResult.id;
+          uploadErrorDetail = uploadResult.error;
+        } catch (remoteErr) {
+          uploadErrorDetail = `Stored media could not be downloaded: ${remoteErr.message}`;
+        }
+      }
+
+      // Legacy templates may have an empty/stale DB path while the original
+      // upload still exists on disk. Resolve it by exact or normalized name.
+      if (!runtimeMediaId) {
+        const legacyPath = findTemplateMediaOnDisk(templateName, dbTemplate?.original_filename);
+        if (legacyPath) {
+          try {
+            const rawBuf = fs.readFileSync(legacyPath);
+            const detectedMime = detectMimeFromBuffer(rawBuf, path.extname(legacyPath));
+            const sanitizedResult = await sanitizeImageForWhatsApp(rawBuf, detectedMime);
+            const uploadResult = await uploadMediaToMeta(sanitizedResult.buffer, sanitizedResult.mimeType, path.basename(legacyPath), phoneNumberId, accessToken);
+            runtimeMediaId = uploadResult.id;
+            uploadErrorDetail = uploadResult.error;
+          } catch (legacyErr) {
+            uploadErrorDetail = `Legacy media upload failed: ${legacyErr.message}`;
+          }
+        }
+      }
+
+      // Never send a public website URL as template media. WhatsApp can expose
+      // that URL's title/domain in the card. Media must be uploaded first and
+      // referenced only by the opaque Meta media id.
+      if (!runtimeMediaId) {
+        const errMsg = `Template "${templateName}" ${format} could not be uploaded to WhatsApp media. ` +
+          `Reason: ${uploadErrorDetail || 'no readable media source found'}. ` +
+          `Please re-upload the intended media and try again; URL fallback is disabled.`;
+        logger.error(`[CentralTemplateSender] ${errMsg}`);
+        mediaResolutionFailed = true;
+        mediaResolutionError = errMsg;
+      }
+
+      if (runtimeMediaId) {
+        finalComponents.unshift({
+          type: 'header',
+          parameters: [{ type: format.toLowerCase(), [format.toLowerCase()]: { id: runtimeMediaId } }]
+        });
+      }
+    } else if (format === 'TEXT') {
+      const match = headerComp.text?.match(/{{(\d+)}}/g);
+      if (match) {
+        const headerParams = match.map((m, i) => {
+          const varNum = String(i + 1);
+          const val = variables[`header_${varNum}`] || variables[varNum] || 'Header_Var';
+          return { type: 'text', text: String(val) };
+        });
+        finalComponents.unshift({ type: 'header', parameters: headerParams });
+      }
+    }
+  }
+
+  // 4. Resolve BODY component variables
+  const bodyComp = metaComponents.find(c => (c.type || '').toUpperCase() === 'BODY');
+  const existingBody = finalComponents.find(c => (c.type || '').toLowerCase() === 'body');
+
+  if (bodyComp && !existingBody) {
+    const match = bodyComp.text?.match(/{{(\d+)}}/g);
+    if (match && match.length > 0) {
+      const bodyParams = match.map((m, i) => {
+        const varNum = String(i + 1);
+        const val = variables[varNum] || variables[`body_${varNum}`] || `Variable_${varNum}`;
+        return { type: 'text', text: String(val) };
+      });
+      finalComponents.push({ type: 'body', parameters: bodyParams });
+    }
+  }
+
+  // 5. Resolve BUTTONS component
+  const buttonComp = metaComponents.find(c => (c.type || '').toUpperCase() === 'BUTTONS');
+  const existingButtons = finalComponents.filter(c => (c.type || '').toLowerCase() === 'button');
+
+  if (buttonComp && existingButtons.length === 0) {
+    const buttonParams = [];
+    buttonComp.buttons?.forEach((btn, index) => {
+      if (btn.type === 'QUICK_REPLY' && (btn.example || btn.text?.includes('{{'))) {
+        buttonParams.push({
+          type: 'button',
+          sub_type: 'quick_reply',
+          index: String(index),
+          parameters: [{ type: 'payload', payload: `payload_${index}` }]
+        });
+      } else if (btn.type === 'URL' && btn.url?.includes('{{1}}')) {
+        const urlVar = variables[`button_${index + 1}`] || variables.url || 'action';
+        buttonParams.push({
+          type: 'button',
+          sub_type: 'url',
+          index: String(index),
+          parameters: [{ type: 'text', text: String(urlVar) }]
+        });
+      } else if (btn.type === 'COPY_CODE' && btn.example) {
+        buttonParams.push({
+          type: 'button',
+          sub_type: 'copy_code',
+          index: String(index),
+          parameters: [{ type: 'coupon_code', coupon_code: btn.example[0] || 'CODE123' }]
+        });
+      }
+    });
+    if (buttonParams.length > 0) {
+      finalComponents.push(...buttonParams);
+    }
+  }
+
+  // 6. Resolve CAROUSEL component
+  const carouselComp = metaComponents.find(c => (c.type || '').toUpperCase() === 'CAROUSEL');
+  const existingCarousel = finalComponents.find(c => (c.type || '').toLowerCase() === 'carousel');
+
+  if (carouselComp && !existingCarousel) {
+    const rawCards = carouselComp.cards || [];
+    const formattedCards = [];
+
+    // Check if we have stored card media in dbTemplate or database
+    let dbCards = [];
+    if (dbTemplate?.cards) {
+      try {
+        dbCards = typeof dbTemplate.cards === 'string' ? JSON.parse(dbTemplate.cards) : dbTemplate.cards;
+      } catch (_) {
+        dbCards = [];
+      }
+    }
+    if ((!dbCards || dbCards.length === 0) && dbTemplate?.meta_response) {
+      try {
+        const parsedMeta = typeof dbTemplate.meta_response === 'string' ? JSON.parse(dbTemplate.meta_response) : dbTemplate.meta_response;
+        if (Array.isArray(parsedMeta.cards)) {
+          dbCards = parsedMeta.cards;
+        }
+      } catch (_) { }
+    }
+    if (!dbCards || dbCards.length === 0) {
+      try {
+        const [wtRows] = await pool.query('SELECT meta_response FROM whatsapp_templates WHERE template_name = ? ORDER BY id DESC LIMIT 1', [templateName]);
+        if (wtRows.length > 0 && wtRows[0].meta_response) {
+          const parsed = typeof wtRows[0].meta_response === 'string' ? JSON.parse(wtRows[0].meta_response) : wtRows[0].meta_response;
+          if (Array.isArray(parsed.cards)) {
+            dbCards = parsed.cards;
+          }
+        }
+      } catch (_) { }
+    }
+
+    for (let i = 0; i < rawCards.length; i++) {
+      const card = rawCards[i];
+      const cardComponents = [];
+      const dbCard = (Array.isArray(dbCards) && dbCards[i]) ? dbCards[i] : {};
+      const customCard = Array.isArray(customCarouselMedia) ? customCarouselMedia[i] : (customCarouselMedia?.[i] || null);
+
+      // Find card header
+      const cardHeader = card.components?.find(c => (c.type || '').toUpperCase() === 'HEADER');
+      if (cardHeader) {
+        const rawMedia = (customCard?.base64 || customCard?.previewUrl || customCard?.headerMedia || customCard?.media_url)
+          || (dbCard.mediaBase64 || dbCard.headerMedia || dbCard.media_url || dbCard.header_handle || null)
+          || (cardHeader.example?.header_handle?.[0] || cardHeader.example?.header_url?.[0] || null);
+
+        const isVid = (cardHeader.format || '').toUpperCase() === 'VIDEO'
+          || (customCard?.mediaType || '').toLowerCase() === 'video'
+          || (dbCard.mediaType || '').toLowerCase() === 'video'
+          || (typeof rawMedia === 'string' && (rawMedia.includes('video') || rawMedia.includes('.mp4') || rawMedia.includes('.webm')));
+
+        const format = isVid ? 'video' : 'image';
+        let runtimeMediaId = null;
+        let cBuffer = null;
+        let cMime = isVid ? 'video/mp4' : 'image/png';
+        const cFileName = isVid ? `card_${i + 1}.mp4` : `card_${i + 1}.png`;
+
+        // 1. Check if rawMedia has base64 data
+        if (rawMedia && typeof rawMedia === 'string' && rawMedia.startsWith('data:')) {
+          try {
+            const rawB64 = rawMedia.replace(/^data:[A-Za-z0-9-+\/]+;base64,/, '');
+            cBuffer = Buffer.from(rawB64, 'base64');
+            const mimeMatch = rawMedia.match(/^data:([A-Za-z0-9-+\/]+);base64,/);
+            if (mimeMatch) cMime = mimeMatch[1];
+          } catch (_) { }
+        } else if (rawMedia && typeof rawMedia === 'string' && !rawMedia.startsWith('http')) {
+          // Check local file on disk
+          const foundDiskPath = findFileOnDisk(rawMedia);
+          if (foundDiskPath) {
+            cBuffer = fs.readFileSync(foundDiskPath);
+            cMime = detectMimeFromBuffer(cBuffer, path.extname(foundDiskPath).toLowerCase());
+            logger.info(`[CentralTemplateSender] ✅ Loaded real media file for Card #${i + 1} from disk: ${foundDiskPath} (${cBuffer.length} bytes)`);
+          }
+        } else if (rawMedia && typeof rawMedia === 'string' && (rawMedia.startsWith('http://') || rawMedia.startsWith('https://'))) {
+          // Download remote media buffer
+          try {
+            const resp = await axios.get(rawMedia, { responseType: 'arraybuffer', timeout: 12000 });
+            if (resp.data) {
+              cBuffer = Buffer.from(resp.data);
+              if (resp.headers['content-type']) cMime = resp.headers['content-type'];
+              logger.info(`[CentralTemplateSender] Downloaded card #${i + 1} media buffer from remote (${cBuffer.length} bytes)`);
+            }
+          } catch (dErr) {
+            logger.warn(`[CentralTemplateSender] Failed to download card media from ${rawMedia}: ${dErr.message}`);
+          }
+        }
+
+        // Try the exact persisted media only. Never substitute an unrelated
+        // file or a generated pixel, because that changes the user's card.
+        if (!cBuffer || cBuffer.length === 0 || (isVid && !cMime.includes('video') && !cMime.includes('mp4'))) {
+          cBuffer = null;
+        }
+
+        if (isVid) {
+          cMime = 'video/mp4';
+        } else if (cBuffer && cBuffer.length > 0) {
+          // Sanitize card images the same way as single headers (fixes CMYK/progressive JPEG issues)
+          const sanitizedCard = await sanitizeImageForWhatsApp(cBuffer, cMime);
+          cBuffer = sanitizedCard.buffer;
+          cMime = sanitizedCard.mimeType;
+        }
+
+        // Upload media to Meta Media API to get a valid runtime Media ID
+        if (cBuffer && cBuffer.length > 0) {
+          const uploadResult = await uploadMediaToMeta(cBuffer, cMime, cFileName, phoneNumberId, accessToken);
+          runtimeMediaId = uploadResult.id;
+          if (uploadResult.error) {
+            logger.warn(`[CentralTemplateSender] Carousel Card #${i + 1} media upload failed: ${uploadResult.error}`);
+          } else {
+            logger.info(`[CentralTemplateSender] Uploaded Carousel Card #${i + 1} media to Meta. ID: ${runtimeMediaId}`);
+          }
+        }
+
+        if (runtimeMediaId) {
+          cardComponents.push({
+            type: 'header',
+            parameters: [
+              {
+                type: format,
+                [format]: { id: runtimeMediaId }
+              }
+            ]
+          });
+        } else {
+          mediaResolutionFailed = true;
+          mediaResolutionError = `Carousel Card #${i + 1} media could not be uploaded to WhatsApp. Please re-upload this card media; URL fallback is disabled.`;
+          logger.error(`[CentralTemplateSender] ${mediaResolutionError}`);
+        }
+      }
+
+      // Find card body
+      const cardBody = card.components?.find(c => (c.type || '').toUpperCase() === 'BODY');
+      if (cardBody) {
+        const match = cardBody.text?.match(/{{(\d+)}}/g);
+        if (match && match.length > 0) {
+          const bodyParams = match.map((m, varIdx) => {
+            const vVal = variables[`card_${i + 1}_${varIdx + 1}`] || variables[`${varIdx + 1}`] || `Item_${varIdx + 1}`;
+            return { type: 'text', text: String(vVal) };
+          });
+          cardComponents.push({ type: 'body', parameters: bodyParams });
+        }
+      }
+
+      // Find card button variables
+      const cardButtons = card.components?.find(c => (c.type || '').toUpperCase() === 'BUTTONS');
+      if (cardButtons && Array.isArray(cardButtons.buttons)) {
+        cardButtons.buttons.forEach((btn, bIndex) => {
+          if (btn.type === 'URL' && btn.url?.includes('{{1}}')) {
+            const urlVal = variables[`card_${i + 1}_btn_${bIndex + 1}`] || 'action';
+            cardComponents.push({
+              type: 'button',
+              sub_type: 'url',
+              index: String(bIndex),
+              parameters: [{ type: 'text', text: String(urlVal) }]
+            });
+          } else if (btn.type === 'QUICK_REPLY' && (btn.example || btn.text?.includes('{{'))) {
+            cardComponents.push({
+              type: 'button',
+              sub_type: 'quick_reply',
+              index: String(bIndex),
+              parameters: [{ type: 'payload', payload: `card_${i}_btn_${bIndex}` }]
+            });
+          }
+        });
+      }
+
+      formattedCards.push({
+        card_index: i,
+        components: cardComponents
+      });
+    }
+
+    if (formattedCards.length > 0) {
+      finalComponents.push({
+        type: 'carousel',
+        cards: formattedCards
+      });
+    }
+  }
+
+  // FINAL SAFETY NET: guarantee every image/video header is sanitized,
+  // regardless of which code path built it above.
+  await enforceHeaderMediaSanitization(finalComponents, phoneNumberId, accessToken, templateName);
+
+  // Absolute privacy rule: no website media link may reach WhatsApp. This
+  // covers caller-supplied components and nested carousel cards too.
+  const containsMediaLink = (value) => {
+    if (!value || typeof value !== 'object') return false;
+    if (typeof value.link === 'string' && /^https?:\/\//i.test(value.link)) return true;
+    return Object.values(value).some(containsMediaLink);
+  };
+  if (containsMediaLink(finalComponents)) {
+    mediaResolutionFailed = true;
+    mediaResolutionError = `Template "${templateName}" still contains a website media link. Sending was stopped so no domain or URL is shown in WhatsApp. Please re-upload the media.`;
+    logger.error(`[CentralTemplateSender] ${mediaResolutionError}`);
+  }
+
+  return {
+    components: finalComponents,
+    mediaResolutionFailed,
+    mediaResolutionError,
+    metaTemplate,
+    dbTemplate
+  };
+}
+
+/**
+ * UNIVERSAL SAFETY NET: whatever produced `finalComponents` (whether our own
+ * template-driven resolution above ran successfully, or the caller/frontend
+ * supplied its own pre-built header because metaComponents/headerComp
+ * couldn't be resolved for some reason — different WABA, template lookup
+ * failure, multi-tenant scoping edge case, etc), this makes ABSOLUTELY SURE
+ * that any image/video header actually goes through Meta's /media upload
+ * with a sanitized (sRGB baseline JPEG) buffer before the message is sent.
+ *
+ * If the header currently has a `link`, we download it, sanitize it (if
+ * image), and re-upload it to get a fresh media `id`. If it already has an
+ * `id` we cannot re-sanitize it (no buffer available) — but this only
+ * happens when the message was themselves resolved by our own upload code,
+ * which already sanitizes.
+ */
+async function enforceHeaderMediaSanitization(finalComponents, phoneNumberId, accessToken, templateName) {
+  const headerIdx = finalComponents.findIndex(c => (c?.type || '').toLowerCase() === 'header');
+  if (headerIdx === -1) return;
+
+  const header = finalComponents[headerIdx];
+  const param = Array.isArray(header.parameters) ? header.parameters[0] : null;
+  if (!param || !['image', 'video'].includes(param.type)) return; // text/document headers untouched
+
+  const mediaObj = param[param.type];
+  if (!mediaObj || !mediaObj.link) return; // already an `id`, or nothing to do
+
+  logger.info(`[CentralTemplateSender] [SafetyNet] Caller-supplied header link detected for "${templateName}" outside normal resolution path — downloading & sanitizing before send: ${mediaObj.link}`);
+
+  try {
+    const resp = await axios.get(mediaObj.link, { responseType: 'arraybuffer', timeout: 15000 });
+    let buf = Buffer.from(resp.data);
+    let mime = resp.headers['content-type'] || detectMimeFromBuffer(buf, param.type === 'video' ? '.mp4' : '.jpg');
+
+    if (param.type === 'image') {
+      const sanitizedResult = await sanitizeImageForWhatsApp(buf, mime);
+      buf = sanitizedResult.buffer;
+      mime = sanitizedResult.mimeType;
+    }
+
+    const uploadResult = await uploadMediaToMeta(
+      buf,
+      mime,
+      `header_safetynet_${templateName}.${param.type === 'video' ? 'mp4' : 'jpg'}`,
+      phoneNumberId,
+      accessToken
+    );
+
+    if (uploadResult.id) {
+      finalComponents[headerIdx] = {
+        type: 'header',
+        parameters: [{ type: param.type, [param.type]: { id: uploadResult.id } }]
+      };
+      logger.success?.(`[CentralTemplateSender] [SafetyNet] Re-uploaded sanitized header media. media_id=${uploadResult.id}`);
+    } else {
+      logger.warn(`[CentralTemplateSender] [SafetyNet] Re-upload failed, leaving original link in place: ${uploadResult.error}`);
+    }
+  } catch (err) {
+    logger.warn(`[CentralTemplateSender] [SafetyNet] Could not download/sanitize caller-supplied header link (${mediaObj.link}): ${err.message}`);
+  }
+}
+
+const componentParameters = (components, type) =>
+  (components || []).find(c => String(c?.type || '').toLowerCase() === type)?.parameters || [];
+
+const fillTemplateText = (text, parameters = []) => String(text || '').replace(/{{\s*(\d+)\s*}}/g, (_, number) => {
+  const parameter = parameters[Number(number) - 1];
+  return String(parameter?.text ?? parameter?.payload ?? parameter?.currency?.fallback_value ?? parameter?.date_time?.fallback_value ?? `{{${number}}}`);
+});
+
+const publicMediaUrl = (value) => {
+  if (!value || typeof value !== 'string') return null;
+  if (/^(https?:|data:)/i.test(value)) return value;
+  const uploadsIndex = value.replace(/\\/g, '/').indexOf('uploads/');
+  if (uploadsIndex < 0) return value;
+  const relative = value.replace(/\\/g, '/').slice(uploadsIndex + 'uploads/'.length);
+  const base = (process.env.SERVER_BASE_URL || process.env.BASE_URL || 'https://officialwaba.com').replace(/\/$/, '');
+  return `${base}/api/uploads/${relative}`;
+};
+
+/** Build the exact, durable representation used by the Chat Inbox. */
+const buildChatSnapshot = ({ templateName, buildResult, customMediaUrl, campaignName = null, languageCode = 'en_US' }) => {
+  const definitions = buildResult.metaTemplate?.components || [];
+  const runtime = buildResult.components || [];
+  const header = definitions.find(c => String(c?.type || '').toUpperCase() === 'HEADER');
+  const body = definitions.find(c => String(c?.type || '').toUpperCase() === 'BODY');
+  const footer = definitions.find(c => String(c?.type || '').toUpperCase() === 'FOOTER');
+  const buttons = definitions.find(c => String(c?.type || '').toUpperCase() === 'BUTTONS');
+  const headerParams = componentParameters(runtime, 'header');
+  const bodyParams = componentParameters(runtime, 'body');
+  const format = String(header?.format || buildResult.dbTemplate?.media_type || '').toLowerCase();
+  const runtimeMedia = headerParams[0]?.[format]?.link;
+  const exampleMedia = header?.example?.header_url?.[0] || header?.example?.header_handle?.[0];
+  const mediaUrl = publicMediaUrl(customMediaUrl || buildResult.dbTemplate?.header_media_url || runtimeMedia || exampleMedia);
+  const bodyText = fillTemplateText(body?.text, bodyParams);
+  const headerText = String(header?.format || '').toUpperCase() === 'TEXT'
+    ? fillTemplateText(header?.text, headerParams)
+    : '';
+  const text = [headerText, bodyText, footer?.text].filter(Boolean).join('\n\n') || `[Template: ${templateName}]`;
+
+  const carousel = definitions.find(c => String(c?.type || '').toUpperCase() === 'CAROUSEL');
+  const cards = (carousel?.cards || []).map((card, index) => {
+    const cardHeader = (card.components || []).find(c => String(c?.type || '').toUpperCase() === 'HEADER');
+    const cardBody = (card.components || []).find(c => String(c?.type || '').toUpperCase() === 'BODY');
+    const cardButtons = (card.components || []).find(c => String(c?.type || '').toUpperCase() === 'BUTTONS');
+    return {
+      index,
+      mediaType: String(cardHeader?.format || '').toLowerCase(),
+      mediaUrl: publicMediaUrl(cardHeader?.example?.header_url?.[0] || cardHeader?.example?.header_handle?.[0]),
+      body: cardBody?.text || '',
+      buttons: cardButtons?.buttons || []
+    };
+  });
+
+  return {
+    templateName,
+    templateLanguage: languageCode,
+    campaignName,
+    text,
+    caption: bodyText,
+    header: header ? { format, text: headerText, mediaUrl } : null,
+    body: bodyText,
+    footer: footer?.text || '',
+    buttons: Array.isArray(buttons?.buttons) ? buttons.buttons : [],
+    cards
+  };
+};
+
+const parseStoredJson = (value, fallback) => {
+  if (!value) return fallback;
+  if (typeof value === 'object') return value;
+  try { return JSON.parse(value); } catch (_) { return fallback; }
+};
+
+/**
+ * Reconstructs an old campaign/template row without sending or uploading media.
+ * Used by Chat Inbox history and sidebar previews.
+ */
+export async function resolveTemplateChatSnapshot({
+  templateName,
+  languageCode = 'en_US',
+  organizationId = null,
+  accountId = null,
+  campaignName = null,
+  components = [],
+  variables = {},
+  customMediaUrl = null
+}) {
+  if (!templateName) return null;
+  let metaTemplate = null;
+  try {
+    metaTemplate = await getTemplateDetails(templateName, languageCode, accountId, organizationId);
+  } catch (err) {
+    logger.warn(`[ChatSnapshot] Could not resolve template "${templateName}": ${err.message}`);
+  }
+  const dbTemplate = await resolveTemplateRecord(templateName, null, organizationId);
+  const runtime = Array.isArray(parseStoredJson(components, [])) ? parseStoredJson(components, []) : [];
+  const storedVariables = parseStoredJson(variables, {});
+  const definitions = metaTemplate?.components || [];
+
+  for (const type of ['header', 'body']) {
+    if (runtime.some(c => String(c?.type || '').toLowerCase() === type)) continue;
+    const definition = definitions.find(c => String(c?.type || '').toLowerCase() === type);
+    const matches = definition?.text?.match(/{{\s*\d+\s*}}/g) || [];
+    if (matches.length) {
+      runtime.push({
+        type,
+        parameters: matches.map((_, index) => ({
+          type: 'text',
+          text: String(storedVariables[type === 'body' ? String(index + 1) : `${type}_${index + 1}`]
+            ?? storedVariables[String(index + 1)] ?? `{{${index + 1}}}`)
+        }))
+      });
+    }
+  }
+
+  return buildChatSnapshot({
+    templateName,
+    languageCode,
+    campaignName,
+    customMediaUrl,
+    buildResult: { components: runtime, metaTemplate, dbTemplate }
+  });
+}
+
+/**
+ * ─────────────────────────────────────────────────────────────────────────────
+ * Authoritative Single Message Sender
+ * ─────────────────────────────────────────────────────────────────────────────
+ */
+export async function sendCentralTemplateMessage({
+  recipient,
+  templateName,
+  templateId = null,
+  languageCode = 'en_US',
+  components = [],
+  variables = {},
+  customMediaUrl = null,
+  customCarouselMedia = null,
+  campaignId = null,
+  campaignName = null,
+  campaignType = 'quick',
+  featureKey = 'quick',
+  userId = 1,
+  organizationId = null,
+  accountId = null
+}) {
+  if (!recipient || !templateName) {
+    return {
+      success: false,
+      statusCode: 400,
+      message: 'Both recipient phone and templateName are required.'
+    };
+  }
+
+  // 1. Resolve Multi-Tenant Credentials
+  const creds = await resolveAccountCredentials(accountId, organizationId);
+  const activeOrgId = creds.organizationId || 1;
+  const activeAccountId = creds.accountId || null;
+
+  if (creds.status && creds.status.toLowerCase() !== 'active') {
+    return {
+      success: false,
+      statusCode: 403,
+      message: 'WhatsApp account is currently Deactive. Please activate the number in Settings.'
+    };
+  }
+
+  if (!creds.phoneId || !creds.token) {
+    return {
+      success: false,
+      statusCode: 400,
+      message: 'No connected WhatsApp Business Account found for your organization. Please connect in Settings.'
+    };
+  }
+
+  // 2. Clean Phone Number (E.164)
+  let cleanPhone = String(recipient).replace(/^[+]/, '').replace(/[^0-9]/g, '').trim();
+  if (cleanPhone.length === 10) {
+    cleanPhone = `91${cleanPhone}`;
+  } else if (cleanPhone.length === 11 && cleanPhone.startsWith('0')) {
+    cleanPhone = `91${cleanPhone.slice(1)}`;
+  }
+
+  if (cleanPhone.length < 7 || cleanPhone.length > 15) {
+    return {
+      success: false,
+      statusCode: 400,
+      message: `Invalid recipient phone number: "${recipient}". Must be 7-15 digits.`
+    };
+  }
+
+  // 3. Blacklist / Opt-out check
+  const isBlocked = await checkBlacklist(cleanPhone, activeOrgId);
+  if (isBlocked) {
+    return {
+      success: false,
+      statusCode: 400,
+      message: 'Recipient is in Opt-out / Blacklist. Message blocked.'
+    };
+  }
+
+  // 4. Credit Pre-check
+  const creditCheck = await hasSufficientCredits(userId, 1, featureKey);
+  if (!creditCheck.sufficient) {
+    return {
+      success: false,
+      statusCode: 400,
+      message: `Insufficient ${featureKey} credits. You have ${creditCheck.available} credit(s) remaining, but 1 credit is required.`
+    };
+  }
+
+  // 5. Build Unified Runtime Components (Header Media, Variables, Buttons)
+  const buildResult = await buildCentralTemplateComponents({
+    templateName,
+    templateId,
+    languageCode,
+    organizationId: activeOrgId,
+    phoneNumberId: creds.phoneId,
+    accessToken: creds.token,
+    suppliedComponents: components,
+    variables,
+    customMediaUrl,
+    customCarouselMedia
+  });
+
+  if (buildResult.mediaResolutionFailed) {
+    logger.error(`[CentralTemplateSender] Aborting send to ${cleanPhone}: ${buildResult.mediaResolutionError}`);
+    return {
+      success: false,
+      statusCode: 400,
+      message: buildResult.mediaResolutionError
+    };
+  }
+  const finalComponents = buildResult.components;
+  const chatSnapshot = buildChatSnapshot({ templateName, buildResult, customMediaUrl, campaignName, languageCode });
+
+  // 6. Build Meta Graph API Payload
+  const payload = {
+    messaging_product: 'whatsapp',
+    recipient_type: 'individual',
+    to: cleanPhone,
+    type: 'template',
+    template: {
+      name: templateName,
+      language: { code: languageCode || 'en_US' },
+      ...(finalComponents && finalComponents.length > 0 ? { components: finalComponents } : {})
+    }
+  };
+
+  const endpoint = `https://graph.facebook.com/${whatsappConfig.apiVersion || 'v19.0'}/${creds.phoneId}/messages`;
+
+  logger.info(`[TEMPLATE_SEND] [${campaignType.toUpperCase()}] Sending template "${templateName}" (${languageCode}) to ${cleanPhone} via PhoneId ${creds.phoneId} for Org ${activeOrgId}`);
+
+  try {
+    const response = await axios.post(endpoint, payload, {
+      headers: {
+        Authorization: `Bearer ${creds.token}`,
+        'Content-Type': 'application/json'
+      },
+      timeout: 15000
+    });
+
+    const messageId = response.data?.messages?.[0]?.id;
+
+    if (!messageId) {
+      throw new Error(response.data?.error?.message || 'No message ID returned from Meta');
+    }
+
+    // 7. Deduct 1 credit on success
+    await deductMessageCredit(userId, 1, `${campaignType.toUpperCase()} message to ${cleanPhone} (Template: ${templateName})`, featureKey);
+
+    // 8. Record in Chat Conversations
+    const chatRecord = await recordChatMessage({
+      userId,
+      organizationId: activeOrgId,
+      whatsappAccountId: activeAccountId,
+      campaignId: campaignId || null,
+      phone: cleanPhone,
+      messageText: chatSnapshot.text,
+      wamid: messageId,
+      sender: 'user',
+      direction: 'outgoing',
+      messageType: chatSnapshot.header?.format || 'template',
+      mediaUrl: chatSnapshot.header?.mediaUrl || null,
+      rawPayload: { templateSnapshot: chatSnapshot, campaignType, featureKey },
+      status: 'sent'
+    });
+
+    return {
+      success: true,
+      messageId,
+      message: chatRecord?.message || null,
+      data: response.data
+    };
+  } catch (err) {
+    const errorDetails = err.response?.data?.error;
+    const errorMsg = errorDetails?.message || err.message;
+    logger.error(`[CentralTemplateSender] Meta send error for ${cleanPhone}: ${errorMsg}`);
+
+    return {
+      success: false,
+      statusCode: err.response?.status || 500,
+      message: errorMsg,
+      details: errorDetails || err.response?.data || null
+    };
+  }
+}
+
+/**
+ * ─────────────────────────────────────────────────────────────────────────────
+ * Authoritative Batch/Campaign Sender  (REWRITTEN LOOP — never gets stuck)
+ * Used by CSV, Tags, Groups, Scheduled, and Birthday campaigns
+ * Supports RESUME: pass existingCampaignId and numbers that already have a
+ * campaign_recipients row for that campaign are skipped.
+ * ─────────────────────────────────────────────────────────────────────────────
+ */
+export async function sendCentralCampaignBatch(campaignData) {
+  const {
+    campaignName,
+    templateName,
+    templateId = null,
+    languageCode = 'en_US',
+    country = null,
+    numbers = [],
+    components = [],
+    variables = {},
+    customMediaUrl = null,
+    customCarouselMedia = null,
+    existingCampaignId = null,
+    userId = 1,
+    senderName = null,
+    senderType = 'User',
+    accountId = null,
+    organizationId = null,
+    featureKey = 'general'
+  } = campaignData;
+
+  if (!numbers || !Array.isArray(numbers) || numbers.length === 0) {
+    return {
+      success: false,
+      message: 'At least one recipient phone number is required.',
+      totalSent: 0,
+      totalFailed: 0
+    };
+  }
+
+  // 1. Resolve Multi-Tenant Credentials
+  const creds = await resolveAccountCredentials(accountId, organizationId);
+  const activeOrgId = creds.organizationId || 1;
+  const activeAccountId = creds.accountId || null;
+
+  if (creds.status && creds.status.toLowerCase() !== 'active') {
+    return {
+      success: false,
+      message: 'WhatsApp account is currently Deactive. Please activate the number in Settings.',
+      totalSent: 0,
+      totalFailed: numbers.length
+    };
+  }
+
+  if (!creds.phoneId || !creds.token) {
+    return {
+      success: false,
+      message: 'No connected WhatsApp Business Account found for your organization.',
+      totalSent: 0,
+      totalFailed: numbers.length
+    };
+  }
+
+  // 2. Pre-build reusable template components (e.g. upload media once for the batch)
+  const buildResult = await buildCentralTemplateComponents({
+    templateName,
+    templateId,
+    languageCode,
+    organizationId: activeOrgId,
+    phoneNumberId: creds.phoneId,
+    accessToken: creds.token,
+    suppliedComponents: components,
+    variables,
+    customMediaUrl,
+    customCarouselMedia
+  });
+
+  if (buildResult.mediaResolutionFailed) {
+    logger.error(`[CentralTemplateSender] Aborting batch for "${campaignName}": ${buildResult.mediaResolutionError}`);
+    const conn = await pool.getConnection();
+    try {
+      let failedCampId = existingCampaignId;
+      if (!failedCampId) {
+        const [r] = await conn.execute(
+          `INSERT INTO campaigns (user_id, sender_name, sender_type, organization_id, whatsapp_account_id, campaign_name, template_name, language_code, country, total_numbers, sent_count, failed_count, status, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, 'failed', NOW())`,
+          [userId || 1, senderName, senderType, activeOrgId, activeAccountId, campaignName || `Campaign - ${templateName}`, templateName, languageCode, country || null, numbers.length, numbers.length]
+        );
+        failedCampId = r.insertId;
+      } else {
+        await conn.execute(
+          `UPDATE campaigns SET status = 'failed', failed_count = ?, sent_count = 0 WHERE id = ?`,
+          [numbers.length, failedCampId]
+        );
+      }
+      for (const rawPhone of numbers) {
+        const cleanPh = String(rawPhone).replace(/^[+]/, '').replace(/[^0-9]/g, '').trim();
+        if (!cleanPh) continue;
+        await conn.execute(
+          `INSERT INTO campaign_recipients (organization_id, whatsapp_account_id, campaign_id, phone, status, error) VALUES (?, ?, ?, ?, 'failed', ?)`,
+          [activeOrgId, activeAccountId, failedCampId, cleanPh, buildResult.mediaResolutionError]
+        ).catch(() => {});
+      }
+      emitToOrganization(activeOrgId, 'sending_history_updated', { type: 'campaign_completed', campaignId: failedCampId, sentCount: 0, failedCount: numbers.length });
+    } finally {
+      conn.release();
+    }
+    return {
+      success: false,
+      message: buildResult.mediaResolutionError,
+      totalSent: 0,
+      totalFailed: numbers.length
+    };
+  }
+  const finalComponents = buildResult.components;
+  const chatSnapshot = buildChatSnapshot({ templateName, buildResult, customMediaUrl, campaignName, languageCode });
+
+  // ── No long-held DB connection: every query uses its own short pool connection.
+  const run = (sql, params) => pool.execute(sql, params);
+  let campaignId = existingCampaignId;
+  let sentCount = 0;
+  let failedCount = 0;
+  const results = [];
+  let loopFinished = false;
+  let fatalError = null;
+  const workerToken = `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  let lockAcquired = false;
+  let heartbeatTimer = null;
+
+  // Counts always come from the real recipient rows, so the UI never lies.
+  const syncCounts = async () => {
+    if (!campaignId) return;
+    const [[c]] = await run(
+      `SELECT
+         SUM(LOWER(status) IN ('sent','delivered','read')) AS ok,
+         SUM(LOWER(status) = 'failed') AS bad
+       FROM campaign_recipients WHERE campaign_id = ?`,
+      [campaignId]
+    );
+    await run(
+      `UPDATE campaigns SET sent_count = ?, failed_count = ? WHERE id = ?`,
+      [Number(c.ok || 0), Number(c.bad || 0), campaignId]
+    );
+    emitToOrganization(activeOrgId, 'sending_history_updated', {
+      type: 'campaign_progress',
+      campaignId,
+      sentCount: Number(c.ok || 0),
+      failedCount: Number(c.bad || 0)
+    });
+  };
+
+  const recordFailure = async (phone, msg) => {
+    failedCount++;
+    results.push({ phone, success: false, error: msg });
+
+    for (let attempt = 1; attempt <= 6; attempt++) {
+      try {
+        await run(
+          `INSERT INTO campaign_recipients (organization_id, whatsapp_account_id, campaign_id, phone, status, error) VALUES (?, ?, ?, ?, 'failed', ?)`,
+          [activeOrgId, activeAccountId, campaignId, phone, msg]
+        );
+        return true;
+      } catch (e) {
+        const retryable =
+          e.code === 'ER_LOCK_DEADLOCK' ||
+          e.code === 'ER_LOCK_WAIT_TIMEOUT' ||
+          /deadlock|lock wait timeout/i.test(e.message);
+
+        if (!retryable || attempt === 6) {
+          logger.error(`[CentralTemplateSender] FAILED to save recipient ${phone} after ${attempt} attempt(s): ${e.message}`);
+          return false;
+        }
+
+        await new Promise(resolve =>
+          setTimeout(resolve, Math.min(2000, 150 * attempt * attempt))
+        );
+      }
+    }
+    return false;
+  };
+
+  try {
+    if (!campaignId) {
+      let campRes;
+      try {
+        [campRes] = await run(
+          `INSERT INTO campaigns (user_id, sender_name, sender_type, organization_id, whatsapp_account_id, campaign_name, template_name, language_code, country, total_numbers, status, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'running', NOW())`,
+          [userId || 1, senderName, senderType, activeOrgId, activeAccountId, campaignName || `Campaign - ${templateName}`, templateName, languageCode, country || null, numbers.length]
+        );
+      } catch (_) {
+        [campRes] = await run(
+          `INSERT INTO campaigns (organization_id, whatsapp_account_id, campaign_name, template_name, language_code, country, total_numbers, status, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, 'running', NOW())`,
+          [activeOrgId, activeAccountId, campaignName || `Campaign - ${templateName}`, templateName, languageCode, country || null, numbers.length]
+        );
+      }
+      campaignId = campRes.insertId;
+      // Save payload only for NEW campaigns (a resume must not overwrite it with empty values)
+      await run(
+        `UPDATE campaigns SET components_json=?,variables_json=?,custom_media_url=?,carousel_media_json=? WHERE id=?`,
+        [JSON.stringify(components || []), JSON.stringify(variables || {}), customMediaUrl || null, JSON.stringify(customCarouselMedia || null), campaignId]
+      ).catch(() => {});
+    } else {
+      await run(
+        `UPDATE campaigns SET user_id = COALESCE(user_id, ?), sender_name = COALESCE(sender_name, ?), sender_type = COALESCE(sender_type, ?), organization_id = COALESCE(organization_id, ?), whatsapp_account_id = COALESCE(whatsapp_account_id, ?) WHERE id = ?`,
+        [userId || 1, senderName, senderType, activeOrgId, activeAccountId, campaignId]
+      );
+    }
+
+    // Atomic campaign ownership: no two workers may send the same campaign.
+    const [claim] = await run(
+      `UPDATE campaigns
+       SET worker_token=?, worker_heartbeat=NOW(),
+           worker_lease_until=DATE_ADD(NOW(), INTERVAL 60 SECOND),
+           status='running'
+       WHERE id=? AND worker_token IS NULL`,
+      [workerToken, campaignId]
+    );
+    if (claim.affectedRows !== 1) {
+      logger.warn(`[CampaignLock] Campaign ${campaignId} is already owned by another worker. Duplicate execution blocked.`);
+      return {
+        success: false,
+        duplicateBlocked: true,
+        campaignId,
+        message: 'Campaign is already being processed by another worker.',
+        sent: 0,
+        failed: 0
+      };
+    }
+    lockAcquired = true;
+
+    heartbeatTimer = setInterval(() => {
+      run(
+        `UPDATE campaigns
+         SET worker_heartbeat=NOW(),
+             worker_lease_until=DATE_ADD(NOW(), INTERVAL 60 SECOND)
+         WHERE id=? AND worker_token=?`,
+        [campaignId, workerToken]
+      ).catch(e => logger.error(`[CampaignLock] Heartbeat failed for ${campaignId}: ${e.message}`));
+    }, 10000);
+
+    const countryDigits = country ? String(country).replace(/[^0-9]/g, '') : '91';
+
+    // RESUME: skip numbers that already have a recipient row for this campaign
+    const alreadyDone = new Set();
+    if (existingCampaignId) {
+      const [done] = await run(`SELECT phone FROM campaign_recipients WHERE campaign_id = ?`, [campaignId]);
+      done.forEach(r => alreadyDone.add(String(r.phone)));
+      logger.info(`[CentralTemplateSender] Campaign ${campaignId}: ${alreadyDone.size} number(s) already processed, continuing with the rest.`);
+    }
+
+    const endpoint = `https://graph.facebook.com/${whatsappConfig.apiVersion || 'v19.0'}/${creds.phoneId}/messages`;
+    let processed = 0;
+
+    const CONCURRENCY = 5;
+    const runRetry = async (...a) => {
+      for (let t = 0; t < 4; t++) {
+        try { return await run(...a); }
+        catch (e) {
+          if (!/Deadlock|Lock wait/i.test(e.message) || t === 3) throw e;
+          await new Promise(r => setTimeout(r, 100 * (t + 1) + Math.random() * 100));
+        }
+      }
+    };
+    const stripBig = (v) => (typeof v === 'string' && v.startsWith('data:') && v.length > 2000) ? '' : v;
+    const slimSnapshot = JSON.parse(JSON.stringify({ ...chatSnapshot, campaignName }, (k, v) => stripBig(v)));
+    const slimMediaUrl = stripBig(chatSnapshot.header?.mediaUrl || null) || null;
+    const processOne = async (rawPhone) => {
+      let cleanPhone = String(rawPhone).replace(/^[+]/, '').replace(/[^0-9]/g, '').trim();
+      if (!cleanPhone) return;
+
+      if (cleanPhone.length === 10 && countryDigits) {
+        cleanPhone = `${countryDigits}${cleanPhone}`;
+      } else if (cleanPhone.length === 11 && cleanPhone.startsWith('0') && countryDigits) {
+        cleanPhone = `${countryDigits}${cleanPhone.slice(1)}`;
+      }
+
+      // Synchronous in-process claim: prevent duplicate phones in this batch.
+      // The claim happens before the first await, so parallel workers cannot
+      // process the same normalized phone twice.
+      if (alreadyDone.has(cleanPhone)) return;
+      alreadyDone.add(cleanPhone);
+
+      // ── One number can NEVER kill the whole campaign ──
+      try {
+        if (await checkBlacklist(cleanPhone, activeOrgId)) {
+          await recordFailure(cleanPhone, 'Recipient is in Opt-out / Blacklist. Message blocked.');
+          return;
+        }
+
+        const creditCheck = await hasSufficientCredits(userId, 1, featureKey);
+        if (!creditCheck.sufficient) {
+          await recordFailure(cleanPhone, `Insufficient ${featureKey} credits.`);
+          return;
+        }
+
+        // Persist the recipient BEFORE contacting Meta.
+        let recipientId;
+        try {
+          const [claim] = await run(
+            `INSERT INTO campaign_recipients
+             (organization_id, whatsapp_account_id, campaign_id, phone, status)
+             VALUES (?, ?, ?, ?, 'sending')`,
+            [activeOrgId, activeAccountId, campaignId, cleanPhone]
+          );
+          recipientId = claim.insertId;
+        } catch (claimErr) {
+          logger.error(`[CentralTemplateSender] PRE-SEND DB CLAIM FAILED: campaign=${campaignId}, phone=${cleanPhone}: ${claimErr.message}`);
+          fatalError = fatalError || claimErr;
+          return;
+        }
+
+        let messageId = null;
+        try {
+          const response = await axios.post(endpoint, {
+            messaging_product: 'whatsapp',
+            recipient_type: 'individual',
+            to: cleanPhone,
+            type: 'template',
+            template: {
+              name: templateName,
+              language: { code: languageCode || 'en_US' },
+              ...(finalComponents && finalComponents.length > 0 ? { components: finalComponents } : {})
+            }
+          }, {
+            headers: {
+              Authorization: `Bearer ${creds.token}`,
+              'Content-Type': 'application/json'
+            },
+            timeout: 15000
+          });
+          messageId = response.data?.messages?.[0]?.id;
+          if (!messageId) {
+            throw new Error(response.data?.error?.message || 'No message ID returned from Meta');
+          }
+        } catch (sendErr) {
+          const definiteRejection = Boolean(sendErr.response);
+          const status = definiteRejection ? 'failed' : 'uncertain';
+          const message = sendErr.response?.data?.error?.message || sendErr.message;
+          await run(
+            `UPDATE campaign_recipients SET status=?, error=? WHERE id=?`,
+            [status, message, recipientId]
+          ).catch(e => logger.error(`[CentralTemplateSender] Send outcome save failed: ${e.message}`));
+          if (definiteRejection) failedCount++;
+          results.push({phone: cleanPhone, success: false, error: message, status});
+          return;
+        }
+
+        // Meta ACCEPTED the message. Save the recipient FIRST so webhooks can match it.
+        sentCount++;
+        results.push({ phone: cleanPhone, success: true, messageId });
+        let recipientSaved = false;
+
+        for (let attempt = 1; attempt <= 6; attempt++) {
+          try {
+            await run(
+              `UPDATE campaign_recipients SET message_id=?, status='sent', error=NULL, sent_at=NOW() WHERE id=?`,
+              [messageId, recipientId]
+            );
+            recipientSaved = true;
+            break;
+          } catch (e) {
+            const retryable =
+              e.code === 'ER_LOCK_DEADLOCK' ||
+              e.code === 'ER_LOCK_WAIT_TIMEOUT' ||
+              /deadlock|lock wait timeout/i.test(e.message);
+
+            if (!retryable || attempt === 6) {
+              logger.error(`[CentralTemplateSender] CRITICAL: Meta accepted ${messageId} for ${cleanPhone}, but recipient insert failed: ${e.message}`);
+              fatalError = fatalError || new Error('Some accepted messages could not be recorded in database.');
+              break;
+            }
+
+            await new Promise(resolve =>
+              setTimeout(resolve, Math.min(2000, 150 * attempt * attempt))
+            );
+          }
+        }
+
+        if (!recipientSaved) {
+          logger.error(`[CentralTemplateSender] UNRECORDED MESSAGE: campaign=${campaignId}, phone=${cleanPhone}, wamid=${messageId}`);
+        }
+
+        // Persist accepted Meta message in chat history before credit bookkeeping.
+        await recordChatMessage({
+          userId,
+          organizationId: activeOrgId,
+          whatsappAccountId: activeAccountId,
+          campaignId,
+          phone: cleanPhone,
+          messageText: chatSnapshot.text,
+          wamid: messageId,
+          sender: 'user',
+          direction: 'outgoing',
+          messageType: chatSnapshot.header?.format || 'template',
+          mediaUrl: slimMediaUrl,
+          rawPayload: { templateSnapshot: slimSnapshot },
+          status: 'sent'
+        }).catch(e => logger.error(`[CentralTemplateSender] chat record failed ${cleanPhone}: ${e.message}`));
+
+        // Credit bookkeeping happens after accepted-message tracking.
+        await deductMessageCredit(userId, 1, `Campaign "${campaignName}" to ${cleanPhone}`, featureKey)
+          .catch(e => logger.error(`[CentralTemplateSender] credit deduct failed ${cleanPhone}: ${e.message}`));
+
+      } catch (numErr) {
+        logger.error(`[CentralTemplateSender] Unexpected error on ${cleanPhone}: ${numErr.stack || numErr.message}`);
+        await recordFailure(cleanPhone, `Internal error: ${numErr.message}`);
+      }
+
+      processed++;
+      if (processed % 20 === 0) await syncCounts().catch(() => {});
+    };
+    const BATCH_SIZE = 5000;
+
+    for (let start = 0; start < numbers.length; start += BATCH_SIZE) {
+      const batch = numbers.slice(start, start + BATCH_SIZE);
+      let cursor = 0;
+
+      const worker = async () => {
+        while (cursor < batch.length) {
+          await processOne(batch[cursor++]);
+        }
+      };
+
+      await Promise.all(
+        Array.from(
+          { length: Math.min(CONCURRENCY, batch.length) },
+          worker
+        )
+      );
+
+      logger.info(
+        `[CentralTemplateSender] Campaign ${campaignId}: batch ${Math.floor(start / BATCH_SIZE) + 1} completed (${start + batch.length}/${numbers.length} numbers).`
+      );
+
+      await syncCounts().catch(e =>
+        logger.warn(`[CentralTemplateSender] Batch sync failed: ${e.message}`)
+      );
+    }
+
+    loopFinished = true;
+  } catch (err) {
+    fatalError = err;
+    logger.error(`[CentralTemplateSender] Campaign ${campaignId} aborted: ${err.stack || err.message}`);
+  } finally {
+    // Only the owning worker may finalize a campaign.
+    if (heartbeatTimer) clearInterval(heartbeatTimer);
+    try {
+      if (campaignId && lockAcquired) {
+        await syncCounts();
+        const [[c]] = await run(
+          `SELECT COUNT(DISTINCT phone) AS tracked,
+                  COUNT(DISTINCT CASE
+                    WHEN LOWER(status) IN ('sent','delivered','read','failed')
+                    THEN phone END) AS resolved,
+                  SUM(LOWER(status) IN ('sending','queued','uncertain')) AS pending
+           FROM campaign_recipients WHERE campaign_id = ?`,
+          [campaignId]
+        );
+        // Never report completion while recipients are missing or unresolved.
+        const complete = loopFinished
+          && !fatalError
+          && Number(c.resolved || 0) >= new Set(numbers.map(n => {
+            let ph = String(n).replace(/[^0-9]/g, '');
+            if (ph.length === 10 && countryDigits) ph = countryDigits + ph;
+            else if (ph.length === 11 && ph.startsWith('0') && countryDigits) ph = countryDigits + ph.slice(1);
+            return ph;
+          }).filter(Boolean)).size
+          && Number(c.pending || 0) === 0;
+        const finalStatus = complete ? 'completed' : 'interrupted';
+        await run(`UPDATE campaigns SET status = ? WHERE id = ?`, [finalStatus, campaignId]);
+        emitToOrganization(activeOrgId, 'sending_history_updated', {
+          type: 'campaign_completed',
+          campaignId,
+          campaignName,
+          sentCount,
+          failedCount
+        });
+      }
+    } catch (e) {
+      logger.error(`[CentralTemplateSender] final status update failed: ${e.message}`);
+    } finally {
+      if (campaignId && lockAcquired) {
+        await run(
+          `UPDATE campaigns
+           SET worker_token=NULL, worker_heartbeat=NULL,
+               worker_lease_until=NULL
+           WHERE id=? AND worker_token=?`,
+          [campaignId, workerToken]
+        ).catch(e => logger.error(`[CampaignLock] Release failed: ${e.message}`));
+      }
+    }
+  }
+
+  if (fatalError) {
+    return {
+      success: false,
+      campaignId,
+      message: fatalError.message,
+      total: numbers.length,
+      sent: sentCount,
+      failed: failedCount,
+      results
+    };
+  }
+
+  return {
+    success: true,
+    campaignId,
+    total: numbers.length,
+    sent: sentCount,
+    failed: failedCount,
+    results
+  };
+}

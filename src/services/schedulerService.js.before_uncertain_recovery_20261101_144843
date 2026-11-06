@@ -1,0 +1,409 @@
+import { pool } from '../config/db.js';
+import { sendCampaignTemplate } from './metaWhatsAppService.js';
+import logger from '../utils/logger.js';
+
+/**
+ * Ensure database schema supports scheduled campaigns.
+ */
+export const ensureScheduleColumns = async () => {
+  let connection;
+  try {
+    connection = await pool.getConnection();
+
+    // Check existing columns once
+    let campFields = [];
+    try {
+      const [cols] = await connection.query(`SHOW COLUMNS FROM campaigns`);
+      campFields = cols.map(c => c.Field);
+    } catch (e) {
+      // Table may not exist yet
+    }
+
+    // Convert status ENUM → VARCHAR so 'scheduled', 'running', 'cancelled', 'interrupted' all work
+    try {
+      const statusCol = (await connection.query(`SHOW COLUMNS FROM campaigns LIKE 'status'`))[0][0];
+      if (statusCol && statusCol.Type && statusCol.Type.toLowerCase().includes('enum')) {
+        await connection.query(`ALTER TABLE campaigns MODIFY COLUMN status VARCHAR(50) NOT NULL DEFAULT 'pending'`);
+        logger.info('[Scheduler] Converted campaigns.status from ENUM to VARCHAR.');
+      }
+    } catch (e) { /* ignore */ }
+
+    // Add scheduled_at if missing
+    if (!campFields.includes('scheduled_at')) {
+      try {
+        await connection.query(`ALTER TABLE campaigns ADD COLUMN scheduled_at DATETIME DEFAULT NULL AFTER country`);
+        logger.info('[Scheduler] Added campaigns.scheduled_at column.');
+      } catch (e) { /* ignore duplicate */ }
+    }
+
+    // Add numbers_json if missing
+    if (!campFields.includes('numbers_json')) {
+      try {
+        await connection.query(`ALTER TABLE campaigns ADD COLUMN numbers_json LONGTEXT DEFAULT NULL`);
+        logger.info('[Scheduler] Added campaigns.numbers_json column.');
+      } catch (e) { /* ignore duplicate */ }
+    }
+
+    // Add organization_id if missing
+    if (!campFields.includes('organization_id')) {
+      try {
+        await connection.query(`ALTER TABLE campaigns ADD COLUMN organization_id INT UNSIGNED NULL AFTER id`);
+        logger.info('[Scheduler] Added campaigns.organization_id column.');
+      } catch (e) { /* ignore duplicate */ }
+    }
+
+    // Add whatsapp_account_id if missing
+    if (!campFields.includes('whatsapp_account_id')) {
+      try {
+        await connection.query(`ALTER TABLE campaigns ADD COLUMN whatsapp_account_id INT UNSIGNED NULL`);
+        logger.info('[Scheduler] Added campaigns.whatsapp_account_id column.');
+      } catch (e) { /* ignore duplicate */ }
+    }
+
+    // Add custom_media_url if missing
+    if (!campFields.includes('custom_media_url')) {
+      try {
+        await connection.query(`ALTER TABLE campaigns ADD COLUMN custom_media_url LONGTEXT DEFAULT NULL`);
+        logger.info('[Scheduler] Added campaigns.custom_media_url column.');
+      } catch (e) { /* ignore duplicate */ }
+    }
+
+    // Add components_json if missing
+    if (!campFields.includes('components_json')) {
+      try {
+        await connection.query(`ALTER TABLE campaigns ADD COLUMN components_json LONGTEXT DEFAULT NULL`);
+        logger.info('[Scheduler] Added campaigns.components_json column.');
+      } catch (e) { /* ignore duplicate */ }
+    }
+
+    // Add variables_json if missing
+    if (!campFields.includes('variables_json')) {
+      try {
+        await connection.query(`ALTER TABLE campaigns ADD COLUMN variables_json LONGTEXT DEFAULT NULL`);
+        logger.info('[Scheduler] Added campaigns.variables_json column.');
+      } catch (e) { /* ignore duplicate */ }
+    }
+
+    // Add carousel_media_json if missing
+    if (!campFields.includes('carousel_media_json')) {
+      try {
+        await connection.query(`ALTER TABLE campaigns ADD COLUMN carousel_media_json LONGTEXT DEFAULT NULL`);
+        logger.info('[Scheduler] Added campaigns.carousel_media_json column.');
+      } catch (e) { /* ignore duplicate */ }
+    }
+
+    logger.info('[Scheduler] Database schema verified for persistent scheduled campaigns.');
+  } catch (err) {
+    logger.error('[Scheduler] DB setup warning:', err.message);
+  } finally {
+    if (connection) connection.release();
+  }
+};
+
+/**
+ * On server startup, any campaign still marked 'running' or 'queued' is dead
+ * (the in-memory sending loop died with the previous process). Mark them
+ * 'interrupted' so the UI stops showing "Executing..." forever.
+ * NOTE: only valid while a SINGLE server process runs the campaigns.
+ * We deliberately do NOT auto-resume, so old campaigns never blast messages
+ * days later. Resume is manual (Run Now / resend remaining numbers).
+ */
+export const markInterruptedCampaigns = async () => {
+  try {
+    const [r] = await pool.execute(
+      `UPDATE campaigns
+       SET status = 'interrupted',
+           worker_lease_until = CASE
+             WHEN worker_token IS NOT NULL THEN NOW()
+             ELSE worker_lease_until
+           END
+       WHERE status = 'running'`
+    );
+    if (r.affectedRows) {
+      logger.warn(`[Scheduler] Marked ${r.affectedRows} stuck campaign(s) as interrupted after server restart.`);
+    }
+  } catch (e) {
+    logger.error('[Scheduler] markInterruptedCampaigns failed:', e.message);
+  }
+};
+
+/**
+ * Find and process due scheduled campaigns directly from MySQL.
+ * Prevents race conditions by atomically setting status = 'running'.
+ */
+export const checkAndRunScheduledCampaigns = async () => {
+  try {
+
+    const [allScheduled] = await pool.execute(
+      `SELECT * FROM campaigns 
+       WHERE status = 'scheduled' 
+         AND scheduled_at IS NOT NULL`
+    );
+
+    const nowMs = Date.now();
+
+    // ── TIMEZONE FIX ──────────────────────────────────────────────────────
+    // scheduled_at is now guaranteed to be a TRUE UTC wall-clock value
+    // (fixed at write-time in campaignController.js -> scheduleCampaign).
+    // MySQL DATETIME columns carry no offset info, so when the mysql2 driver
+    // hands it back to us it may arrive either as a JS Date object (already
+    // correctly parsed against the driver/session timezone) or as a bare
+    // "YYYY-MM-DD HH:mm:ss" string. We normalize both cases into a proper
+    // UTC ISO string before comparing, so this always lines up with Date.now().
+    // The old "+5:30 tolerance" hack has been removed — it was a band-aid
+    // for the root timezone bug, which is now fixed at the source.
+    const dueCampaigns = (allScheduled || []).filter(c => {
+      if (!c.scheduled_at) return false;
+
+      const raw =
+        c.scheduled_at instanceof Date
+          ? c.scheduled_at.toISOString()
+          : `${String(c.scheduled_at).replace(' ', 'T')}Z`;
+
+      const schedDate = new Date(raw);
+      if (isNaN(schedDate.getTime())) return false;
+
+      return schedDate.getTime() <= nowMs;
+    });
+    // ─────────────────────────────────────────────────────────────────────
+
+    if (dueCampaigns && dueCampaigns.length > 0) {
+      logger.info(`[Scheduler] ⏰ Found ${dueCampaigns.length} due scheduled campaign(s) to process.`);
+    }
+
+    for (const campaign of dueCampaigns) {
+      // Atomically claim the campaign to prevent duplicate processing
+      const [claimResult] = await pool.execute(
+        `UPDATE campaigns SET status = 'running' WHERE id = ? AND status = 'scheduled'`,
+        [campaign.id]
+      );
+
+      if (claimResult.affectedRows === 0) {
+        // Already picked up by another execution thread
+        continue;
+      }
+
+      logger.info(`[Scheduler] 🚀 Processing scheduled campaign ID ${campaign.id} "${campaign.campaign_name}"...`);
+
+      let numbers = [];
+      try {
+        numbers = JSON.parse(campaign.numbers_json || '[]');
+      } catch (err) {
+        logger.error(`[Scheduler] Invalid numbers_json for campaign ID ${campaign.id}:`, err.message);
+      }
+
+      if (!numbers || numbers.length === 0) {
+        await pool.execute(`UPDATE campaigns SET status = 'failed' WHERE id = ?`, [campaign.id]);
+        logger.error(`[Scheduler] Campaign ID ${campaign.id} failed: No valid numbers found.`);
+        continue;
+      }
+
+      let savedComponents = [];
+      try { if (campaign.components_json) savedComponents = JSON.parse(campaign.components_json); } catch (_) {}
+      let savedVariables = {};
+      try { if (campaign.variables_json) savedVariables = JSON.parse(campaign.variables_json); } catch (_) {}
+      let savedCarouselMedia = null;
+      try { if (campaign.carousel_media_json) savedCarouselMedia = JSON.parse(campaign.carousel_media_json); } catch (_) {}
+
+      try {
+        const result = await sendCampaignTemplate({
+          existingCampaignId: campaign.id,
+          userId: campaign.user_id || 1,
+          senderName: campaign.sender_name || null,
+          senderType: campaign.sender_type || 'User',
+          campaignName: campaign.campaign_name,
+          templateName: campaign.template_name,
+          languageCode: campaign.language_code || 'en_US',
+          country: campaign.country,
+          numbers,
+          components: savedComponents,
+          variables: savedVariables,
+          customMediaUrl: campaign.custom_media_url || null,
+          customCarouselMedia: savedCarouselMedia,
+          accountId: campaign.whatsapp_account_id || null,
+          organizationId: campaign.organization_id || null,
+        });
+
+        logger.info(`[Scheduler] ✅ Finished scheduled campaign ID ${campaign.id}. Sent: ${result.sent}, Failed: ${result.failed}`);
+      } catch (err) {
+        logger.error(`[Scheduler] ❌ Failed executing scheduled campaign ID ${campaign.id}:`, err.message);
+        await pool.execute(`UPDATE campaigns SET status = 'failed' WHERE id = ?`, [campaign.id]);
+      }
+    }
+  } catch (err) {
+    if (err.code === 'ECONNREFUSED') {
+      logger.warn('[Scheduler] Database is offline or unreachable. Will retry on next interval.');
+    } else {
+      logger.error('[Scheduler] Error checking scheduled campaigns:', err.message);
+    }
+  }
+};
+
+/**
+ * Initialize background scheduler loop.
+ * Runs continuously in Node.js process regardless of UI state.
+ */
+
+// Persistent queued dispatcher. Central Sender owns the DB worker lock.
+const queuedActive = new Set();
+const queuedAccounts = new Set();
+let queuedScanning = false;
+
+export async function processDurableQueuedCampaigns() {
+  if (queuedScanning) return;
+  queuedScanning = true;
+  try {
+    const [jobs] = await pool.execute(
+      `SELECT * FROM campaigns
+       WHERE status='queued'
+         AND worker_token IS NULL
+         AND (scheduled_at IS NULL OR scheduled_at<=NOW())
+       ORDER BY id LIMIT 20`
+    );
+
+    for (const c of jobs) {
+      if (queuedActive.size >= 2) break;
+
+      const accountKey = c.whatsapp_account_id
+        ? `account:${c.whatsapp_account_id}`
+        : `org:${c.organization_id}`;
+
+      if (queuedActive.has(c.id) || queuedAccounts.has(accountKey)) continue;
+
+      let numbers;
+      try {
+        numbers = JSON.parse(c.numbers_json || '[]');
+        if (!Array.isArray(numbers) || !numbers.length)
+          throw new Error('Invalid recipient list');
+      } catch (e) {
+        logger.error(`[Queue] Invalid campaign ${c.id}: ${e.message}`);
+        await pool.execute(
+          `UPDATE campaigns SET status='interrupted'
+           WHERE id=? AND status='queued'`,
+          [c.id]
+        );
+        continue;
+      }
+
+      const parse = (value, fallback) => {
+        try { return value ? JSON.parse(value) : fallback; }
+        catch { return fallback; }
+      };
+
+      const data = {
+        existingCampaignId: c.id,
+        userId: c.user_id || 1,
+        senderName: c.sender_name,
+        senderType: c.sender_type || 'User',
+        organizationId: c.organization_id,
+        accountId: c.whatsapp_account_id,
+        campaignName: c.campaign_name,
+        templateName: c.template_name,
+        languageCode: c.language_code || 'en_US',
+        country: c.country,
+        numbers,
+        components: parse(c.components_json, []),
+        variables: parse(c.variables_json, {}),
+        customMediaUrl: c.custom_media_url,
+        customCarouselMedia: parse(c.carousel_media_json, null),
+        featureKey: c.feature_key || 'quick'
+      };
+
+      queuedActive.add(c.id);
+      queuedAccounts.add(accountKey);
+
+      Promise.resolve()
+        .then(() => sendCampaignTemplate(data))
+        .then(result => logger.info(
+          `[Queue] Campaign ${c.id}: ${JSON.stringify({
+            success: result?.success,
+            sent: result?.sent,
+            failed: result?.failed
+          })}`
+        ))
+        .catch(e => logger.error(
+          `[Queue] Campaign ${c.id} failed: ${e.stack || e.message}`
+        ))
+        .finally(() => {
+          queuedActive.delete(c.id);
+          queuedAccounts.delete(accountKey);
+        });
+    }
+  } catch (e) {
+    logger.error(`[Queue] Dispatcher: ${e.message}`);
+  } finally {
+    queuedScanning = false;
+  }
+}
+
+
+// Safe recovery: only campaigns that were explicitly opted into recovery.
+// Previously recorded recipients are never automatically resent.
+async function recoverSafeCampaigns() {
+  try {
+    const [columns] = await pool.query(
+      "SHOW COLUMNS FROM campaigns LIKE 'auto_recover'"
+    );
+    if (!columns.length) {
+      logger.info('[Recovery] auto_recover column absent; recovery disabled.');
+      return;
+    }
+
+    const [rows] = await pool.execute(
+      `SELECT id FROM campaigns
+       WHERE status='interrupted'
+         AND auto_recover=1
+         AND worker_token IS NULL
+         AND numbers_json IS NOT NULL
+       ORDER BY id ASC LIMIT 20`
+    );
+
+    for (const c of rows) {
+      await pool.execute(
+        `UPDATE campaigns SET status='queued'
+         WHERE id=? AND status='interrupted'
+           AND auto_recover=1 AND worker_token IS NULL`,
+        [c.id]
+      );
+      logger.info(`[Recovery] Requeued campaign ${c.id}`);
+    }
+  } catch(e) {
+    logger.error(`[Recovery] Error: ${e.message}`);
+  }
+}
+
+export const initScheduler = async () => {
+  await ensureScheduleColumns();
+
+  // Keep automatic recovery disabled until durable recipient tracking is ready.
+  // Avoid duplicate Meta sends after restart.
+  await markInterruptedCampaigns();
+
+  // Release expired locks only for opted-in interrupted campaigns.
+  await pool.execute(
+    `UPDATE campaigns
+     SET worker_token=NULL,
+         worker_heartbeat=NULL,
+         worker_lease_until=NULL
+     WHERE status='interrupted'
+       AND auto_recover=1
+       AND worker_token IS NOT NULL
+       AND worker_lease_until < NOW()`
+  );
+
+  // Resume only campaigns explicitly marked as safe for recovery.
+  await recoverSafeCampaigns();
+
+  processDurableQueuedCampaigns();
+
+  // Run initial check immediately on server startup
+  checkAndRunScheduledCampaigns();
+
+  // Poll every 15 seconds continuously
+  setInterval(() => {
+    checkAndRunScheduledCampaigns();
+    processDurableQueuedCampaigns();
+  }, 15_000);
+
+  logger.info('[Scheduler] Background campaign scheduler active (15s interval).');
+};

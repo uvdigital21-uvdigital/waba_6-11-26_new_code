@@ -1,0 +1,26 @@
+{
+  "verbose": false,
+  "ignore": [
+    "logs/*",
+    "logs/**",
+    "**/logs/**",
+    "webhooks/*",
+    "webhooks/**",
+    "**/webhooks/**",
+    "payloads/*",
+    "payloads/**",
+    "**/payloads/**",
+    "uploads/*",
+    "uploads/**",
+    "**/uploads/**",
+    "exports/*",
+    "exports/**",
+    "**/exports/**",
+    "debug/*",
+    "debug/**",
+    "**/debug/**",
+    "*.json",
+    "node_modules/**"
+  ],
+  "ext": "js,mjs,cjs,env"
+}

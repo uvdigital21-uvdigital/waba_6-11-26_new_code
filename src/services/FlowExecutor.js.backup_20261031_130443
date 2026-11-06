@@ -1,0 +1,1312 @@
+import { pool } from '../config/db.js';
+import logger from '../utils/logger.js';
+import axios from 'axios';
+import fs from 'fs';
+import path from 'path';
+import FormData from 'form-data';
+import whatsappConfig from '../config/whatsapp.js';
+import { recordChatMessage } from './chatService.js';
+import { emitSocketEvent } from '../utils/socket.js';
+import { normalizePhone, get10DigitSuffix } from '../utils/phoneUtils.js';
+import { checkBlacklist } from './blacklistService.js';
+
+const processedWamids = new Set();
+
+/**
+ * Clean & Normalize Incoming Messages & Keywords
+ */
+function normalizeString(str) {
+  if (!str) return '';
+  return String(str)
+    .replace(/[\u200B-\u200D\uFEFF]/g, '')
+    .replace(/[\r\n\t]/g, ' ')
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, ' ');
+}
+
+function escapeRegex(str) {
+  return String(str).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function isKeywordMatch(input, kw) {
+  if (!input || !kw) return false;
+  if (kw === '*') return true;
+  if (input === kw) return true;
+
+  // Multi-word phrase check (e.g. "price list", "track order")
+  if (kw.includes(' ')) {
+    return input.includes(kw);
+  }
+
+  // Single word: use word boundary check so short words like "hi" or "seo" don't match substrings like "this" or "season"
+  try {
+    const rx = new RegExp(`\\b${escapeRegex(kw)}\\b`, 'i');
+    return rx.test(input);
+  } catch (e) {
+    return input.split(/\s+/).includes(kw);
+  }
+}
+
+export class FlowExecutor {
+
+  /**
+   * Main Entrypoint for WhatsApp Chatbot Flow Execution Engine
+   */
+  static async execute({ wamid = null, phone, inputStr = '', buttonPayload = null, listPayload = null, locationPayload = null, organizationId = null, whatsappAccountId = null, expressArrivalMs = null }) {
+    const flowStartMs = Date.now();
+    const arrivalMs = expressArrivalMs || flowStartMs;
+
+    try {
+      const cleanPhone = normalizePhone(phone);
+      if (!cleanPhone) {
+        logger.error(`[CHATBOT] Execution stopped: Invalid phone number "${phone}"`);
+        return { success: false, reason: 'invalid_phone' };
+      }
+
+      // Check Blacklist
+      const isBlocked = await checkBlacklist(cleanPhone);
+      if (isBlocked) {
+        logger.warn(`[BLACKLIST] Cancelled chatbot execution for blacklisted number: ${cleanPhone}`);
+        return { success: false, reason: 'blacklisted', message: 'Recipient is blacklisted.' };
+      }
+
+      if (wamid && processedWamids.has(wamid)) {
+        logger.info(`[CHATBOT] Duplicate webhook WAMID ${wamid} detected. Skipping bot execution.`);
+        return { success: false, reason: 'duplicate_wamid' };
+      }
+      if (wamid) {
+        processedWamids.add(wamid);
+        if (processedWamids.size > 5000) {
+          const first = processedWamids.values().next().value;
+          processedWamids.delete(first);
+        }
+      }
+
+      const rawInput = String(inputStr || buttonPayload || listPayload || '').trim();
+      const normalizedInput = normalizeString(rawInput);
+
+      logger.info(`[WA CHATBOT] Incoming Message: "${rawInput}" (Org: ${organizationId || 'Default'}, Account: ${whatsappAccountId || 'Default'})`);
+      logger.info(`[WA CHATBOT] Normalized: "${normalizedInput}"`);
+
+      const suffix10 = get10DigitSuffix(cleanPhone);
+      const [convRows] = await pool.execute(
+        `SELECT id, contact_name, assigned_user_id FROM conversations 
+         WHERE (contact_phone = ? OR RIGHT(REGEXP_REPLACE(contact_phone, '[^0-9]', ''), 10) = ?) LIMIT 1`,
+        [cleanPhone, suffix10]
+      );
+
+      const conversation = convRows.length > 0 ? convRows[0] : null;
+
+      if (conversation && conversation.assigned_user_id && conversation.assigned_user_id > 0) {
+        logger.info(`[CHATBOT] Execution stopped: Phone ${cleanPhone} connected to Live Agent (User ID ${conversation.assigned_user_id}).`);
+        return { success: false, reason: 'live_agent_mode' };
+      }
+
+      // Opt-Out handling
+      if (['stop', 'unsubscribe', 'optout', 'opt-out'].includes(normalizedInput)) {
+        await pool.execute(`INSERT IGNORE INTO chatbot_optouts (phone) VALUES (?)`, [cleanPhone]);
+        await pool.execute(`DELETE FROM chatbot_user_sessions WHERE phone = ?`, [cleanPhone]);
+        await this.sendMetaMessage({
+          phone: cleanPhone,
+          payload: { type: 'text', text: { body: 'You have been unsubscribed from automated messages. Reply START anytime to subscribe again.' } },
+          organizationId,
+          whatsappAccountId,
+          expressArrivalMs: arrivalMs
+        });
+        return { success: true, optOut: true };
+      }
+
+      const [optOutRows] = await pool.execute(`SELECT phone FROM chatbot_optouts WHERE phone = ?`, [cleanPhone]);
+      if (optOutRows.length > 0 && !['start', 'subscribe'].includes(normalizedInput)) {
+        logger.info(`[CHATBOT] Ignoring message from opted-out phone ${cleanPhone}`);
+        return { success: false, reason: 'opted_out' };
+      }
+
+      // Fetch active flows specifically for this tenant/account
+      let flowQuery = `SELECT id, name, company_id, whatsapp_account_id, status, priority FROM chatbot_flows WHERE status = 'active'`;
+      const flowParams = [];
+
+      if (whatsappAccountId) {
+        flowQuery += ` AND (whatsapp_account_id = ? OR (whatsapp_account_id IS NULL AND (company_id = ? OR company_id IS NULL)))`;
+        flowParams.push(whatsappAccountId, organizationId || 1);
+      } else if (organizationId) {
+        flowQuery += ` AND (company_id = ? OR company_id IS NULL)`;
+        flowParams.push(organizationId);
+      }
+
+      flowQuery += ` ORDER BY priority ASC, id ASC`;
+      const [activeFlows] = await pool.execute(flowQuery, flowParams);
+
+      if (activeFlows.length === 0) {
+        logger.info(`[CHATBOT] Execution stopped: No active chatbot flows found for org=${organizationId}, account=${whatsappAccountId}.`);
+        return { success: false, reason: 'no_active_flows' };
+      }
+
+      let activeFlowId = null;
+      let currentNodeId = null;
+      let context = {
+        phone: cleanPhone,
+        name: conversation ? conversation.contact_name : `WhatsApp User ${cleanPhone.slice(-4)}`
+      };
+
+      const [sessions] = await pool.execute(
+        `SELECT * FROM chatbot_user_sessions WHERE phone = ?`,
+        [cleanPhone]
+      );
+
+      let matchedKeyword = null;
+      let matchedFlowName = null;
+
+      // CASE A: Active Session Exists -> Lock execution to active session
+      if (sessions.length > 0) {
+        const session = sessions[0];
+        activeFlowId = session.flow_id;
+        currentNodeId = session.current_node_id;
+        try {
+          context = { ...context, ...JSON.parse(session.context || '{}') };
+        } catch (e) { }
+
+        if (activeFlowId > 0 && currentNodeId) {
+          const [sessionNodes] = await pool.execute(
+            `SELECT type, data FROM chatbot_nodes WHERE flow_id = ? AND node_id = ?`,
+            [activeFlowId, currentNodeId]
+          );
+
+          if (sessionNodes.length > 0) {
+            const sType = (sessionNodes[0].type || '').toLowerCase();
+            let sData = {};
+            try { sData = typeof sessionNodes[0].data === 'string' ? JSON.parse(sessionNodes[0].data) : (sessionNodes[0].data || {}); } catch (e) { }
+
+            if (['text_button', 'button', 'template', 'list_message', 'text_list', 'list'].includes(sType)) {
+              const rawBtns = Array.isArray(sData.buttons) ? sData.buttons : [];
+              let matchedBtn = null;
+
+              for (const b of rawBtns) {
+                const bText = normalizeString(b.text || b.title || b.id);
+                if (
+                  (buttonPayload && String(buttonPayload).toLowerCase() === String(b.id || '').toLowerCase()) ||
+                  normalizedInput === bText ||
+                  (bText && normalizedInput.includes(bText))
+                ) {
+                  matchedBtn = b;
+                  break;
+                }
+              }
+
+              if (matchedBtn) {
+                const [allEdges] = await pool.execute(
+                  `SELECT target, source_handle FROM chatbot_edges WHERE flow_id = ? AND source = ?`,
+                  [activeFlowId, currentNodeId]
+                );
+
+                let targetEdge = allEdges.find(e => {
+                  if (!e.source_handle) return false;
+                  const sh = String(e.source_handle).toLowerCase().trim();
+                  const btnId = String(matchedBtn.id || '').toLowerCase().trim();
+                  const btnText = normalizeString(matchedBtn.text || matchedBtn.title || '');
+                  const btnIndex = String(rawBtns.indexOf(matchedBtn));
+
+                  return (
+                    sh === `button-${btnId}` ||
+                    sh === `template-btn-${btnId}` ||
+                    sh === btnId ||
+                    sh === `button-${btnText}` ||
+                    sh === btnText ||
+                    sh === `btn-${btnIndex}` ||
+                    sh === `button-${btnIndex}` ||
+                    sh === `btn_${btnIndex}` ||
+                    sh === `handle-${btnId}`
+                  );
+                });
+
+                if (targetEdge) {
+                  logger.info(`[CHATBOT] Button Clicked: "${matchedBtn.text || matchedBtn.id}" -> Target Node: ${targetEdge.target}`);
+                  currentNodeId = targetEdge.target;
+                  matchedKeyword = `button:${matchedBtn.text || matchedBtn.id}`;
+                  const [fRow] = await pool.execute(`SELECT name FROM chatbot_flows WHERE id = ?`, [activeFlowId]);
+                  if (fRow.length > 0) matchedFlowName = fRow[0].name;
+
+                  await pool.execute(`DELETE FROM chatbot_user_sessions WHERE phone = ?`, [cleanPhone]);
+                } else {
+                  logger.warn(`[CHATBOT] Button "${matchedBtn.text || matchedBtn.id}" clicked but no matching connected edge found.`);
+                  return { success: false, reason: 'unmatched_button_edge' };
+                }
+              } else {
+                logger.info(`[CHATBOT] Contact ${cleanPhone} sent non-button input "${normalizedInput}" during active flow. Checking for keyword override.`);
+                // If user typed something that didn't match a button, allow keyword matching to run
+                activeFlowId = null;
+                currentNodeId = null;
+                matchedKeyword = null;
+              }
+            } else {
+              // Current node in session was not interactive, allow keyword matching
+              activeFlowId = null;
+              currentNodeId = null;
+              matchedKeyword = null;
+            }
+          } else {
+            // Node no longer exists, clear invalid session
+            await pool.execute(`DELETE FROM chatbot_user_sessions WHERE phone = ?`, [cleanPhone]);
+            activeFlowId = null;
+            currentNodeId = null;
+          }
+        }
+      }
+
+      // CASE B: Match Keywords & Execute Flow (when not continuing a button click)
+      if (!matchedKeyword && !currentNodeId) {
+        let matchedFlowObj = null;
+        let matchedStartNodeId = null;
+
+        // Build list of candidate active flows with their starting nodes & keywords
+        const candidateFlows = [];
+        for (const flow of activeFlows) {
+          const [nodes] = await pool.execute(`SELECT * FROM chatbot_nodes WHERE flow_id = ?`, [flow.id]);
+          const startNodes = nodes.filter(n => ['starting_keyword', 'start', 'keyword'].includes((n.type || '').toLowerCase()));
+
+          for (const sNode of startNodes) {
+            let data = {};
+            try { data = typeof sNode.data === 'string' ? JSON.parse(sNode.data) : (sNode.data || {}); } catch (e) { }
+
+            let keywords = [];
+            if (Array.isArray(data.keywords)) keywords = data.keywords;
+            else if (typeof data.keywords === 'string') keywords = data.keywords.split(/[\n,;]+/).map(k => k.trim());
+
+            const [kwDbRows] = await pool.execute(`SELECT keyword FROM chatbot_keywords WHERE flow_id = ?`, [flow.id]);
+            kwDbRows.forEach(k => keywords.push(k.keyword));
+
+            const cleanKeywords = Array.from(new Set(keywords.map(k => normalizeString(k)).filter(k => k.length > 0)));
+            if (cleanKeywords.length > 0) {
+              candidateFlows.push({ flow, sNode, cleanKeywords });
+            }
+          }
+        }
+
+        // Pass 1: Exact matches (highest priority - user input exactly equals keyword)
+        for (const { flow, sNode, cleanKeywords } of candidateFlows) {
+          for (const kw of cleanKeywords) {
+            if (kw !== '*' && normalizedInput === kw) {
+              matchedFlowObj = flow;
+              matchedStartNodeId = sNode.node_id;
+              matchedKeyword = kw;
+              break;
+            }
+          }
+          if (matchedFlowObj) break;
+        }
+
+        // Pass 2: Whole-word or multi-word phrase match (e.g. phrase contains "price list" or word contains "seo")
+        if (!matchedFlowObj) {
+          for (const { flow, sNode, cleanKeywords } of candidateFlows) {
+            for (const kw of cleanKeywords) {
+              if (kw !== '*' && isKeywordMatch(normalizedInput, kw)) {
+                matchedFlowObj = flow;
+                matchedStartNodeId = sNode.node_id;
+                matchedKeyword = kw;
+                break;
+              }
+            }
+            if (matchedFlowObj) break;
+          }
+        }
+
+        // Pass 3: Wildcard fallback ('*')
+        if (!matchedFlowObj) {
+          for (const { flow, sNode, cleanKeywords } of candidateFlows) {
+            if (cleanKeywords.includes('*')) {
+              matchedFlowObj = flow;
+              matchedStartNodeId = sNode.node_id;
+              matchedKeyword = '*';
+              break;
+            }
+          }
+        }
+
+        if (matchedFlowObj && matchedStartNodeId) {
+          activeFlowId = matchedFlowObj.id;
+          matchedFlowName = matchedFlowObj.name;
+          currentNodeId = matchedStartNodeId;
+          await pool.execute(`DELETE FROM chatbot_user_sessions WHERE phone = ?`, [cleanPhone]).catch(() => {});
+          logger.info(`[WA CHATBOT] Matched keyword "${matchedKeyword}" -> Flow ID ${activeFlowId} ("${matchedFlowName}"), Starting Node: ${currentNodeId}`);
+        }
+      }
+
+      if (!matchedKeyword && !currentNodeId) {
+        logger.info(`[WA CHATBOT] Execution stopped: No active flow or keyword match for "${normalizedInput}".`);
+        return { success: false, reason: 'no_keyword_match' };
+      }
+
+      // Update execution_count and last_executed_at
+      await pool.execute(
+        `UPDATE chatbot_flows SET execution_count = execution_count + 1, last_executed_at = NOW() WHERE id = ?`,
+        [activeFlowId]
+      ).catch(() => { });
+
+      logger.info(`[WA CHATBOT] Matched Keyword: "${matchedKeyword}"`);
+      logger.info(`[WA CHATBOT] Matched Flow: Flow ID ${activeFlowId} ("${matchedFlowName}")`);
+
+      // Advance from starting_keyword to connected target node
+      if (currentNodeId) {
+        const [startNodeRow] = await pool.execute(
+          `SELECT type FROM chatbot_nodes WHERE flow_id = ? AND node_id = ?`,
+          [activeFlowId, currentNodeId]
+        );
+
+        if (startNodeRow.length > 0 && ['starting_keyword', 'start', 'keyword'].includes((startNodeRow[0].type || '').toLowerCase())) {
+          const [firstEdges] = await pool.execute(
+            `SELECT target FROM chatbot_edges WHERE flow_id = ? AND source = ?`,
+            [activeFlowId, currentNodeId]
+          );
+          if (firstEdges.length > 0) {
+            currentNodeId = firstEdges[0].target;
+          }
+        }
+      }
+
+      // ✅ FIX: reset loop protection for every fresh run.
+      // Without this, old visitedNodes/depth saved in the session context make the
+      // engine think a loop happened and it silently stops without replying.
+      context.visitedNodes = [];
+      context.depth = 0;
+
+      // Traverse Connected Nodes
+      await this.traverseNode({
+        flowId: activeFlowId,
+        flowName: matchedFlowName,
+        nodeId: currentNodeId,
+        phone: cleanPhone,
+        inputStr: normalizedInput,
+        buttonPayload,
+        listPayload,
+        locationPayload,
+        context,
+        matchedKeyword,
+        organizationId,
+        whatsappAccountId,
+        expressArrivalMs: arrivalMs
+      });
+
+      const totalMs = Date.now() - arrivalMs;
+      logger.info(`[WA CHATBOT] Status: success (${totalMs} ms)`);
+      return { success: true, flowId: activeFlowId, executionTimeMs: totalMs };
+
+    } catch (err) {
+      logger.error('[WA CHATBOT] Execution error:', err.message);
+      return { success: false, error: err.message };
+    }
+  }
+
+  /**
+   * Traverse nodes in an iterative, stateful loop (No recursion)
+   */
+  static async traverseNode({ flowId, flowName, nodeId, phone, inputStr, buttonPayload, listPayload, locationPayload, context, matchedKeyword, organizationId = null, whatsappAccountId = null, expressArrivalMs = null }) {
+    let currentNodeId = nodeId;
+
+    while (currentNodeId) {
+      if (!flowId || !currentNodeId) break;
+
+      // Loop & Max Depth Protection
+      context.visitedNodes = context.visitedNodes || [];
+      context.depth = (context.depth || 0) + 1;
+
+      if (context.visitedNodes.includes(currentNodeId) || context.depth > 100) {
+        logger.warn(`[CHATBOT] Loop or maximum execution depth (100) exceeded on node ${currentNodeId}. Stopping execution.`);
+        await pool.execute(`DELETE FROM chatbot_user_sessions WHERE phone = ?`, [phone]);
+        break;
+      }
+      context.visitedNodes.push(currentNodeId);
+
+      const [nodes] = await pool.execute(
+        `SELECT * FROM chatbot_nodes WHERE flow_id = ? AND node_id = ?`,
+        [flowId, currentNodeId]
+      );
+
+      if (nodes.length === 0) {
+        await pool.execute(`DELETE FROM chatbot_user_sessions WHERE phone = ?`, [phone]);
+        break;
+      }
+
+      const node = nodes[0];
+      let data = {};
+      try {
+        data = typeof node.data === 'string' ? JSON.parse(node.data) : (node.data || {});
+      } catch (e) {
+        data = {};
+      }
+
+      const nodeType = (node.type || '').toLowerCase().replace(/[\s\-_]+/g, '_');
+      const startTime = Date.now();
+
+      logger.info(`[WA CHATBOT] Executing Node: ${nodeType}:${node.node_id} (Org: ${organizationId}, Account: ${whatsappAccountId})`);
+
+      const [edges] = await pool.execute(
+        `SELECT * FROM chatbot_edges WHERE flow_id = ? AND source = ?`,
+        [flowId, currentNodeId]
+      );
+
+      let nextNodeId = edges.length > 0 ? edges[0].target : null;
+      let isInteractive = false;
+
+      // Log Execution History in Database
+      try {
+        await pool.execute(
+          `INSERT INTO chatbot_execution_logs (customer_phone, matched_keyword, flow_id, executed_node, execution_time, status) 
+           VALUES (?, ?, ?, ?, ?, 'success')`,
+          [phone, matchedKeyword || inputStr || null, flowId, `${nodeType}:${node.node_id}`, Date.now() - startTime]
+        ).catch(() => { });
+      } catch (e) { }
+
+      switch (nodeType) {
+
+        case 'starting_keyword':
+        case 'start':
+        case 'keyword': {
+          break;
+        }
+
+        case 'text_reply':
+        case 'text':
+        case 'message': {
+          const messageText = this.parseVariables(data.message || data.text || data.label || 'Hello!', context);
+          await this.sendMetaMessage({
+            phone,
+            payload: { type: 'text', text: { body: messageText } },
+            flowId,
+            nodeId: currentNodeId,
+            matchedKeyword,
+            organizationId,
+            whatsappAccountId,
+            expressArrivalMs
+          });
+          break;
+        }
+
+        case 'url_button':
+        case 'url': {
+          const caption = this.parseVariables(data.caption || data.message || data.label || 'Visit Our Website!', context);
+          const targetUrl = data.url || 'https://example.com';
+          const buttonDisplayText = String(data.buttonText || data.button_text || 'Visit Now!').slice(0, 20);
+
+          const ctaPayload = {
+            type: 'interactive',
+            interactive: {
+              type: 'cta_url',
+              body: { text: caption },
+              action: {
+                name: 'cta_url',
+                parameters: { display_text: buttonDisplayText, url: targetUrl }
+              }
+            }
+          };
+
+          await this.sendMetaMessage({
+            phone,
+            payload: ctaPayload,
+            flowId,
+            nodeId: currentNodeId,
+            matchedKeyword,
+            organizationId,
+            whatsappAccountId,
+            expressArrivalMs
+          });
+          break;
+        }
+
+        case 'text_button':
+        case 'button': {
+          const messageText = this.parseVariables(data.message || data.caption || data.label || 'Please select an option:', context);
+          const rawBtns = Array.isArray(data.buttons) ? data.buttons : [{ id: 'btn_1', text: 'Option 1' }];
+
+          await this.sendInteractiveButtons({
+            phone,
+            messageText,
+            rawBtns,
+            flowId,
+            nodeId: currentNodeId,
+            matchedKeyword,
+            organizationId,
+            whatsappAccountId,
+            expressArrivalMs
+          });
+
+          if (rawBtns.length > 0) {
+            isInteractive = true;
+          }
+          break;
+        }
+
+        case 'media_button':
+        case 'media_caption':
+        case 'media': {
+          const caption = this.parseVariables(data.caption || data.message || '', context);
+          let rawMediaUrl = data.mediaUrl || data.fileUrl || data.file || data.url || null;
+          let rawType = (data.mediaType || data.fileType || '').toLowerCase();
+          const ext = rawMediaUrl ? path.extname(rawMediaUrl.split('?')[0]).toLowerCase() : '';
+
+          let mediaType = 'document';
+          if (
+            rawType === 'image' ||
+            ['.jpg', '.jpeg', '.png', '.webp', '.gif'].includes(ext)
+          ) {
+            mediaType = 'image';
+          } else if (
+            rawType === 'video' ||
+            ['.mp4', '.3gp', '.mov', '.avi'].includes(ext)
+          ) {
+            mediaType = 'video';
+          } else if (
+            rawType === 'audio' ||
+            ['.mp3', '.ogg', '.aac', '.m4a', '.wav', '.amr'].includes(ext)
+          ) {
+            mediaType = 'audio';
+          } else {
+            mediaType = 'document';
+          }
+
+          const mediaId = rawMediaUrl ? await this.uploadMediaToMeta(rawMediaUrl, organizationId, whatsappAccountId) : null;
+          const docFileName = data.mediaName || data.filename || (rawMediaUrl ? path.basename(rawMediaUrl) : 'document.pdf');
+
+          let fullMediaUrl = rawMediaUrl;
+          if (fullMediaUrl && !fullMediaUrl.startsWith('http://') && !fullMediaUrl.startsWith('https://')) {
+            const baseUrl = process.env.PUBLIC_URL || process.env.APP_URL || `http://localhost:${process.env.PORT || 5000}`;
+            fullMediaUrl = `${baseUrl.replace(/\/$/, '')}${fullMediaUrl.startsWith('/') ? '' : '/'}${fullMediaUrl}`;
+          }
+
+          const rawBtns = Array.isArray(data.buttons) ? data.buttons.filter(b => b && (b.text || b.title)) : [];
+
+          let payload;
+          if (nodeType === 'media_button' && rawBtns.length > 0) {
+            // Interactive reply buttons with media header
+            const formattedButtons = rawBtns.slice(0, 3).map((b, idx) => ({
+              type: 'reply',
+              reply: {
+                id: String(b.id || `btn_${idx + 1}`),
+                title: String(b.text || b.title || `Option ${idx + 1}`).slice(0, 20)
+              }
+            }));
+
+            let headerObj = null;
+            if (['image', 'video', 'document'].includes(mediaType)) {
+              if (mediaId) {
+                headerObj = {
+                  type: mediaType,
+                  [mediaType]: mediaType === 'document' ? { id: mediaId, filename: docFileName } : { id: mediaId }
+                };
+              } else if (fullMediaUrl) {
+                headerObj = {
+                  type: mediaType,
+                  [mediaType]: mediaType === 'document' ? { link: fullMediaUrl, filename: docFileName } : { link: fullMediaUrl }
+                };
+              }
+            }
+
+            payload = {
+              type: 'interactive',
+              interactive: {
+                type: 'button',
+                ...(headerObj ? { header: headerObj } : {}),
+                body: { text: caption || 'Please select an option:' },
+                action: { buttons: formattedButtons }
+              }
+            };
+            isInteractive = true;
+          } else {
+            // Standard media message
+            if (mediaId) {
+              const mediaObj = { id: mediaId };
+              if (caption && mediaType !== 'audio') mediaObj.caption = caption;
+              if (mediaType === 'document') mediaObj.filename = docFileName;
+              payload = { type: mediaType, [mediaType]: mediaObj };
+            } else if (fullMediaUrl) {
+              const mediaObj = { link: fullMediaUrl };
+              if (caption && mediaType !== 'audio') mediaObj.caption = caption;
+              if (mediaType === 'document') mediaObj.filename = docFileName;
+              payload = { type: mediaType, [mediaType]: mediaObj };
+            } else {
+              payload = { type: 'text', text: { body: caption || '[Media Message]' } };
+            }
+          }
+
+          await this.sendMetaMessage({
+            phone,
+            payload,
+            flowId,
+            nodeId: currentNodeId,
+            matchedKeyword,
+            organizationId,
+            whatsappAccountId,
+            expressArrivalMs
+          });
+          break;
+        }
+
+        case 'list_message':
+        case 'text_list':
+        case 'list': {
+          const bodyText = this.parseVariables(data.body || data.message || 'Please choose an option from the menu:', context);
+          const headerText = data.header || 'Menu';
+          const buttonText = String(data.buttonText || data.button_text || data.menuButtonText || data.menu_button_text || 'View Menu').slice(0, 20);
+
+          let listRows = [];
+          if (Array.isArray(data.items) && data.items.length > 0) {
+            listRows = data.items.map((it, idx) => ({
+              id: String(it.id || `item_${idx + 1}`),
+              title: String(it.title || it.text || `Option ${idx + 1}`).slice(0, 24),
+              description: it.description ? String(it.description).slice(0, 72) : undefined
+            }));
+          } else if (Array.isArray(data.rows) && data.rows.length > 0) {
+            listRows = data.rows.map((r, idx) => ({
+              id: String(r.id || `row_${idx + 1}`),
+              title: String(r.title || r.text || `Item ${idx + 1}`).slice(0, 24),
+              description: r.description ? String(r.description).slice(0, 72) : undefined
+            }));
+          }
+
+          // Rows saved by the new Text + List node (data.buttons)
+          if (listRows.length === 0 && Array.isArray(data.buttons) && data.buttons.length > 0) {
+            listRows = data.buttons
+              .filter((b) => b && String(b.text || b.title || '').trim())
+              .map((b, idx) => ({
+                id: String(b.id || `btn_${idx + 1}`).slice(0, 200),
+                title: String(b.text || b.title).trim().slice(0, 24),
+                description: b.description ? String(b.description).slice(0, 72) : undefined
+              }));
+          }
+
+          if (listRows.length > 0) {
+            const listPayload = {
+              type: 'interactive',
+              interactive: {
+                type: 'list',
+                header: { type: 'text', text: headerText },
+                body: { text: bodyText },
+                action: {
+                  button: buttonText,
+                  sections: [{ title: 'Options', rows: listRows.slice(0, 10) }]
+                }
+              }
+            };
+            await this.sendMetaMessage({
+              phone,
+              payload: listPayload,
+              flowId,
+              nodeId: currentNodeId,
+              matchedKeyword,
+              organizationId,
+              whatsappAccountId,
+              expressArrivalMs
+            });
+            isInteractive = true;
+          } else {
+            await this.sendMetaMessage({
+              phone,
+              payload: { type: 'text', text: { body: `*${headerText}*\n${bodyText}` } },
+              flowId,
+              nodeId: currentNodeId,
+              matchedKeyword,
+              organizationId,
+              whatsappAccountId,
+              expressArrivalMs
+            });
+          }
+          break;
+        }
+
+        case 'request_location':
+        case 'location': {
+          const msgText = this.parseVariables(data.message || '📍 Please share your current location.', context);
+          await this.sendMetaMessage({
+            phone,
+            payload: { type: 'text', text: { body: msgText } },
+            flowId,
+            nodeId: currentNodeId,
+            matchedKeyword,
+            organizationId,
+            whatsappAccountId,
+            expressArrivalMs
+          });
+          break;
+        }
+
+        case 'template': {
+          const templateName = data.templateName || data.template_name || data.name;
+          const languageCode = data.languageCode || data.language || 'en_US';
+
+          if (templateName) {
+            const templatePayload = {
+              type: 'template',
+              template: {
+                name: templateName,
+                language: { code: languageCode }
+              }
+            };
+
+            await this.sendMetaMessage({
+              phone,
+              payload: templatePayload,
+              flowId,
+              nodeId: currentNodeId,
+              matchedKeyword,
+              organizationId,
+              whatsappAccountId,
+              expressArrivalMs
+            });
+
+            if (Array.isArray(data.buttons) && data.buttons.length > 0) {
+              isInteractive = true;
+            }
+          }
+          break;
+        }
+
+        case 'add_group':
+        case 'group': {
+          const groupId = data.groupId || data.group_id;
+          const groupName = data.groupName || data.group_name;
+          let targetGroupId = groupId;
+          if (!targetGroupId && groupName) {
+            const [gRows] = await pool.execute(`SELECT id, numbers_json FROM contact_groups WHERE LOWER(name) = ? LIMIT 1`, [String(groupName).toLowerCase()]);
+            if (gRows.length > 0) targetGroupId = gRows[0].id;
+          }
+          if (targetGroupId) {
+            const [grpRows] = await pool.execute(`SELECT id, numbers_json FROM contact_groups WHERE id = ?`, [targetGroupId]);
+            if (grpRows.length > 0) {
+              let existingList = [];
+              try { existingList = JSON.parse(grpRows[0].numbers_json || '[]'); } catch (e) {}
+              const alreadyExists = existingList.some(item => (typeof item === 'string' ? item : item.phone) === phone);
+              if (!alreadyExists) {
+                existingList.push({ phone, name: context.name || 'WhatsApp Contact', addedAt: new Date().toISOString() });
+                await pool.execute(
+                  `UPDATE contact_groups SET numbers_json = ?, total_contacts = ? WHERE id = ?`,
+                  [JSON.stringify(existingList), existingList.length, targetGroupId]
+                ).catch(() => {});
+              }
+            }
+          }
+          break;
+        }
+
+        case 'add_tag':
+        case 'tag': {
+          const tagName = data.tagName || data.tag_name || data.name;
+          const tagId = data.tagId || data.tag_id;
+
+          let finalTagId = tagId;
+          const companyId = organizationId || 1;
+          if (!finalTagId && tagName) {
+            const [existingTag] = await pool.execute(`SELECT id FROM tags WHERE LOWER(name) = ? AND (organization_id = ? OR organization_id IS NULL) LIMIT 1`, [String(tagName).toLowerCase(), companyId]);
+            if (existingTag.length > 0) {
+              finalTagId = existingTag[0].id;
+            } else {
+              const [newTag] = await pool.execute(`INSERT INTO tags (organization_id, name, color) VALUES (?, ?, '#3B82F6')`, [companyId, tagName]);
+              finalTagId = newTag.insertId;
+            }
+          }
+
+          if (finalTagId) {
+            await pool.execute(`INSERT IGNORE INTO contact_tags (phone, tag_id) VALUES (?, ?)`, [phone, finalTagId]).catch(() => { });
+          }
+          break;
+        }
+
+        case 'push_webhook':
+        case 'webhook': {
+          const webhookUrl = data.webhookUrl || data.url;
+          if (webhookUrl && (webhookUrl.startsWith('http://') || webhookUrl.startsWith('https://'))) {
+            try {
+              const method = (data.method || 'POST').toUpperCase();
+              const payloadData = {
+                phone,
+                flowId,
+                nodeId: currentNodeId,
+                matchedKeyword,
+                context,
+                timestamp: new Date().toISOString()
+              };
+              if (method === 'GET') {
+                await axios.get(webhookUrl, { params: payloadData, timeout: 5000 }).catch(() => {});
+              } else {
+                await axios.post(webhookUrl, payloadData, { timeout: 5000 }).catch(() => {});
+              }
+            } catch (wErr) {
+              logger.warn(`[CHATBOT] push_webhook error: ${wErr.message}`);
+            }
+          }
+          break;
+        }
+
+        case 'create_ticket':
+        case 'ticket': {
+          const department = data.department || 'Support';
+          const priority = data.priority || 'Medium';
+          await pool.execute(
+            `INSERT INTO support_tickets (phone, department, priority, status, created_at) 
+             VALUES (?, ?, ?, 'open', NOW())`,
+            [phone, department, priority]
+          ).catch(() => {});
+          break;
+        }
+
+        case 'connect_agent':
+        case 'agent': {
+          const agentId = data.agentId || data.assigned_user_id || 1;
+          const [convRows] = await pool.execute(
+            `SELECT id FROM conversations WHERE contact_phone = ? OR RIGHT(REGEXP_REPLACE(contact_phone, '[^0-9]', ''), 10) = ? LIMIT 1`,
+            [phone, phone.slice(-10)]
+          );
+          if (convRows.length > 0) {
+            await pool.execute(
+              `UPDATE conversations SET assigned_user_id = ? WHERE id = ?`,
+              [agentId, convRows[0].id]
+            ).catch(() => {});
+          }
+          await this.sendMetaMessage({
+            phone,
+            payload: { type: 'text', text: { body: 'You are now connected with a support agent.' } },
+            flowId,
+            nodeId: currentNodeId,
+            matchedKeyword,
+            organizationId,
+            whatsappAccountId,
+            expressArrivalMs
+          });
+          break;
+        }
+
+        case 'whatsapp_form':
+        case 'form': {
+          const formText = this.parseVariables(data.message || 'Please provide your details below:', context);
+          await this.sendMetaMessage({
+            phone,
+            payload: { type: 'text', text: { body: formText } },
+            flowId,
+            nodeId: currentNodeId,
+            matchedKeyword,
+            organizationId,
+            whatsappAccountId,
+            expressArrivalMs
+          });
+          break;
+        }
+
+        case 'delay': {
+          const delaySecs = Number(data.delaySeconds || data.seconds || 0) + (Number(data.minutes || 0) * 60) + (Number(data.hours || 0) * 3600);
+          if (delaySecs > 0 && delaySecs <= 10) {
+            await new Promise(res => setTimeout(res, delaySecs * 1000));
+          }
+          break;
+        }
+
+        case 'condition': {
+          const varVal = String(context[data.variable || 'message'] || inputStr || '').toLowerCase();
+          const compareVal = String(data.value || '').toLowerCase();
+          const operator = data.operator || 'equals';
+
+          let isTrue = false;
+          if (operator === 'equals') isTrue = varVal === compareVal;
+          else if (operator === 'contains') isTrue = varVal.includes(compareVal);
+          else if (operator === 'starts_with') isTrue = varVal.startsWith(compareVal);
+          else if (operator === 'ends_with') isTrue = varVal.endsWith(compareVal);
+
+          const targetHandle = isTrue ? 'true' : 'false';
+          const branchEdge = edges.find(e => e.source_handle === targetHandle || e.sourceHandle === targetHandle || e.sourceHandle === (isTrue ? 'if' : 'else'));
+          nextNodeId = branchEdge ? branchEdge.target : (edges[0] ? edges[0].target : null);
+          break;
+        }
+
+        case 'end_flow':
+        case 'end': {
+          await pool.execute(`DELETE FROM chatbot_user_sessions WHERE phone = ?`, [phone]);
+          return;
+        }
+      }
+
+      // If interactive node (e.g. Buttons/List): SAVE SESSION & EXIT LOOP IMMEDIATELY!
+      if (isInteractive) {
+        logger.info(`[CHATBOT] Interactive node ${currentNodeId} sent. Saving session and stopping execution.`);
+        await pool.execute(
+          `INSERT INTO chatbot_user_sessions (phone, flow_id, current_node_id, context, updated_at) 
+           VALUES (?, ?, ?, ?, NOW()) 
+           ON DUPLICATE KEY UPDATE flow_id = VALUES(flow_id), current_node_id = VALUES(current_node_id), context = VALUES(context), updated_at = NOW()`,
+          [phone, flowId, currentNodeId, JSON.stringify(context)]
+        );
+        break; // STOP LOOP & RETURN
+      }
+
+      // Non-interactive node: if next node exists, save state & apply 700ms pacing delay before next iteration
+      if (nextNodeId) {
+        await pool.execute(
+          `INSERT INTO chatbot_user_sessions (phone, flow_id, current_node_id, context, updated_at) 
+           VALUES (?, ?, ?, ?, NOW()) 
+           ON DUPLICATE KEY UPDATE flow_id = VALUES(flow_id), current_node_id = VALUES(current_node_id), context = VALUES(context), updated_at = NOW()`,
+          [phone, flowId, nextNodeId, JSON.stringify(context)]
+        );
+
+        // Pacing delay (700ms) between consecutive non-interactive outgoing messages
+        await new Promise(res => setTimeout(res, 700));
+        currentNodeId = nextNodeId; // ADVANCE TO NEXT NODE IN LOOP!
+      } else {
+        // End of flow graph reached: delete session
+        await pool.execute(`DELETE FROM chatbot_user_sessions WHERE phone = ?`, [phone]);
+        break;
+      }
+    }
+  }
+
+  /**
+   * Send WhatsApp message via Meta Cloud API, store in DB, emit Socket.IO
+   */
+  static async sendMetaMessage({ phone, payload, flowId = null, nodeId = null, matchedKeyword = null, organizationId = null, whatsappAccountId = null, expressArrivalMs = null }) {
+    let phoneNumberId = null;
+    let token = null;
+    let accStatus = null;
+
+    if (whatsappAccountId || organizationId) {
+      try {
+        let accQuery = 'SELECT phone_number_id, access_token, status FROM whatsapp_accounts WHERE ';
+        const accParams = [];
+        if (whatsappAccountId) {
+          accQuery += 'id = ?';
+          accParams.push(whatsappAccountId);
+        } else {
+          accQuery += 'organization_id = ?';
+          accParams.push(organizationId);
+        }
+        accQuery += ' LIMIT 1';
+        const [accRows] = await pool.query(accQuery, accParams);
+        if (accRows.length > 0 && accRows[0].phone_number_id) {
+          accStatus = accRows[0].status || 'Active';
+          phoneNumberId = accRows[0].phone_number_id;
+          if (accRows[0].access_token) {
+            try {
+              token = (await import('../utils/encryption.js')).decryptToken(accRows[0].access_token);
+            } catch (_) {
+              token = accRows[0].access_token;
+            }
+          }
+        }
+      } catch (accErr) {
+        logger.warn('[WA CHATBOT] Error fetching tenant credentials for sendMetaMessage:', accErr.message);
+      }
+    }
+
+    if (accStatus && accStatus.toLowerCase() !== 'active') {
+      logger.warn(`[WA CHATBOT] Execution cancelled: WhatsApp Account ID ${whatsappAccountId || organizationId} is ${accStatus}`);
+      return { success: false, message: 'WhatsApp account is currently Deactive.' };
+    }
+
+    if (!phoneNumberId) phoneNumberId = process.env.PHONE_NUMBER_ID || whatsappConfig.phoneNumberId;
+    if (!token) token = process.env.ACCESS_TOKEN || whatsappConfig.accessToken;
+    const version = process.env.API_VERSION || whatsappConfig.apiVersion || 'v23.0';
+
+    if (!phoneNumberId || !token) {
+      logger.error('[WA CHATBOT] Execution stopped: Missing PHONE_NUMBER_ID or ACCESS_TOKEN for tenant');
+      return null;
+    }
+
+    const url = `https://graph.facebook.com/${version}/${phoneNumberId}/messages`;
+    try {
+      const cleanPhone = normalizePhone(phone);
+      const isBlocked = await checkBlacklist(cleanPhone);
+      if (isBlocked) {
+        logger.warn(`[BLACKLIST] Cancelled sendMetaMessage to blacklisted recipient: ${cleanPhone}`);
+        return { success: false, message: 'Recipient is blacklisted.' };
+      }
+      const bodyData = { messaging_product: 'whatsapp', recipient_type: 'individual', to: cleanPhone, ...payload };
+
+      const tMetaStart = Date.now();
+      logger.info(`[WA CHATBOT] Sending Meta Graph API Request to ${cleanPhone} (PhoneID: ${phoneNumberId}, Org: ${organizationId})`);
+
+      const response = await axios.post(url, bodyData, {
+        headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+        timeout: 10000
+      });
+
+      const tMetaEnd = Date.now();
+      const metaDurationMs = tMetaEnd - tMetaStart;
+      const wamid = response.data?.messages?.[0]?.id || `wamid.bot_${Date.now()}`;
+      const messageText = payload.text?.body ||
+        payload.interactive?.body?.text ||
+        payload.image?.caption ||
+        payload.document?.caption ||
+        payload.video?.caption ||
+        payload.image?.link ||
+        payload.document?.link ||
+        payload.video?.link ||
+        payload.audio?.link ||
+        payload.template?.name ||
+        '[Media Message]';
+
+      logger.info(`[WA CHATBOT] Meta API Response: ${response.status} OK (${metaDurationMs} ms) — WAMID: ${wamid}`);
+
+      const recordResult = await recordChatMessage({
+        userId: 1,
+        organizationId,
+        whatsappAccountId,
+        phone: cleanPhone,
+        messageText,
+        wamid,
+        sender: 'user',
+        direction: 'outgoing',
+        messageType: payload.type || 'text',
+        status: 'sent',
+        flowId,
+        nodeId
+      });
+
+      console.log(`\n==================== [WA CHATBOT REPLY SENT] ====================`);
+      console.log(`phone_number_id=${phoneNumberId}`);
+      console.log(`to=${cleanPhone}`);
+      console.log(`reply_text="${messageText}"`);
+      console.log(`wamid=${wamid}`);
+      console.log(`organization_id=${organizationId}`);
+      console.log(`whatsapp_account_id=${whatsappAccountId}`);
+      console.log(`db_message_id=${recordResult?.messageId}`);
+      console.log(`=================================================================\n`);
+
+      return wamid;
+
+    } catch (err) {
+      logger.error(`[WA CHATBOT ERROR] Meta API send error (${err.response?.status || 'N/A'}):`, err.response?.data?.error?.message || err.message);
+      return null;
+    }
+  }
+
+  /**
+   * Dedicated Helper to send Meta WhatsApp Cloud API Interactive Reply Buttons
+   * Handles 0 buttons (text fallback), 1-3 buttons (interactive reply buttons), >3 buttons (interactive list message)
+   */
+  static async sendInteractiveButtons({ phone, messageText, rawBtns, flowId, nodeId, matchedKeyword, organizationId = null, whatsappAccountId = null, expressArrivalMs = null }) {
+    console.log('==========================================================');
+    console.log('[TRACE-C] FlowExecutor.sendInteractiveButtons() ENTERED');
+    console.log('[TRACE-C] messageText:', messageText);
+    console.log('[TRACE-C] rawBtns:', JSON.stringify(rawBtns));
+    console.log('[TRACE-C] rawBtns isArray:', Array.isArray(rawBtns));
+    console.log('[TRACE-C] rawBtns.length:', rawBtns?.length);
+    console.log('==========================================================');
+
+    if (!Array.isArray(rawBtns) || rawBtns.length === 0) {
+      console.log('[TRACE-C] BRANCH: 0 buttons -> text fallback');
+      return await this.sendMetaMessage({
+        phone,
+        payload: { type: 'text', text: { body: messageText } },
+        flowId,
+        nodeId,
+        matchedKeyword,
+        organizationId,
+        whatsappAccountId,
+        expressArrivalMs
+      });
+    }
+
+    if (rawBtns.length > 3) {
+      // >3 buttons -> Convert to Interactive List Message per Meta Cloud API limits
+      const listRows = rawBtns.slice(0, 10).map((b, idx) => ({
+        id: String(b.id || `btn_${idx + 1}`),
+        title: String(b.text || b.title || `Option ${idx + 1}`).slice(0, 24)
+      }));
+
+      const listPayload = {
+        type: 'interactive',
+        interactive: {
+          type: 'list',
+          header: { type: 'text', text: 'Select Option' },
+          body: { text: messageText },
+          action: {
+            button: 'View Options',
+            sections: [
+              {
+                title: 'Options Menu',
+                rows: listRows
+              }
+            ]
+          }
+        }
+      };
+
+      return await this.sendMetaMessage({
+        phone,
+        payload: listPayload,
+        flowId,
+        nodeId,
+        matchedKeyword,
+        organizationId,
+        whatsappAccountId,
+        expressArrivalMs
+      });
+    }
+
+    // 1–3 buttons -> Official Meta WhatsApp Cloud API Interactive Reply Buttons
+    console.log('[TRACE-C] BRANCH: 1-3 buttons -> interactive reply buttons');
+    const formattedButtons = rawBtns.slice(0, 3).map((b, idx) => ({
+      type: 'reply',
+      reply: {
+        id: String(b.id || `btn_${idx + 1}`),
+        title: String(b.text || b.title || `Option ${idx + 1}`).slice(0, 20)
+      }
+    }));
+
+    const interactivePayload = {
+      type: 'interactive',
+      interactive: {
+        type: 'button',
+        body: { text: messageText },
+        action: { buttons: formattedButtons }
+      }
+    };
+
+    console.log('==========================================================');
+    console.log('[TRACE-C] FINAL INTERACTIVE PAYLOAD:');
+    console.log(JSON.stringify(interactivePayload, null, 2));
+    console.log('==========================================================');
+
+    return await this.sendMetaMessage({
+      phone,
+      payload: interactivePayload,
+      flowId,
+      nodeId,
+      matchedKeyword,
+      organizationId,
+      whatsappAccountId,
+      expressArrivalMs
+    });
+  }
+
+  /**
+   * Upload a local media file directly to Meta Cloud API to get a MEDIA_ID using tenant credentials
+   */
+  static async uploadMediaToMeta(mediaUrl, organizationId = null, whatsappAccountId = null) {
+    if (!mediaUrl || typeof mediaUrl !== 'string') return null;
+
+    try {
+      let cleanPath = mediaUrl.replace(/\\/g, '/');
+      if (cleanPath.startsWith('http://') || cleanPath.startsWith('https://')) {
+        try {
+          const urlObj = new URL(cleanPath);
+          cleanPath = urlObj.pathname;
+        } catch (e) { }
+      }
+
+      const cleanBase = path.basename(cleanPath);
+
+      // Candidate local file paths on server
+      const possiblePaths = [
+        path.join(process.cwd(), cleanPath),
+        path.join(process.cwd(), cleanPath.replace(/^\//, '')),
+        path.join(process.cwd(), 'uploads', 'chatbot', cleanBase),
+        path.join(process.cwd(), 'uploads', cleanBase),
+        path.join(process.cwd(), 'backend', 'backend', 'uploads', 'chatbot', cleanBase),
+        path.join(process.cwd(), 'backend', 'uploads', 'chatbot', cleanBase),
+        path.join('D:/wa-app/backend/backend/uploads/chatbot', cleanBase),
+        path.join('D:/wa-app/uploads/chatbot', cleanBase),
+        path.join(process.cwd(), '..', cleanPath.replace(/^\//, '')),
+        path.join(process.cwd(), '..', cleanPath),
+        path.join(process.cwd(), 'public', cleanPath.replace(/^\//, ''))
+      ];
+
+      let localFilePath = possiblePaths.find(p => fs.existsSync(p));
+      if (!localFilePath) {
+        logger.warn(`[CHATBOT] Local file not found for upload to Meta: ${mediaUrl}`);
+        return null;
+      }
+
+      let phoneNumberId = null;
+      let token = null;
+
+      if (whatsappAccountId || organizationId) {
+        try {
+          let accQuery = 'SELECT phone_number_id, access_token FROM whatsapp_accounts WHERE ';
+          const accParams = [];
+          if (whatsappAccountId) {
+            accQuery += 'id = ?';
+            accParams.push(whatsappAccountId);
+          } else {
+            accQuery += 'organization_id = ?';
+            accParams.push(organizationId);
+          }
+          accQuery += ' LIMIT 1';
+          const [accRows] = await pool.query(accQuery, accParams);
+          if (accRows.length > 0 && accRows[0].phone_number_id) {
+            phoneNumberId = accRows[0].phone_number_id;
+            if (accRows[0].access_token) {
+              try {
+                token = (await import('../utils/encryption.js')).decryptToken(accRows[0].access_token);
+              } catch (_) {
+                token = accRows[0].access_token;
+              }
+            }
+          }
+        } catch (accErr) {
+          logger.warn('[CHATBOT] Error fetching tenant credentials for uploadMediaToMeta:', accErr.message);
+        }
+      }
+
+      if (!phoneNumberId) phoneNumberId = process.env.PHONE_NUMBER_ID || whatsappConfig.phoneNumberId;
+      if (!token) token = process.env.ACCESS_TOKEN || whatsappConfig.accessToken;
+      const version = process.env.API_VERSION || whatsappConfig.apiVersion || 'v23.0';
+
+      if (!phoneNumberId || !token) return null;
+
+      const fileBuffer = fs.readFileSync(localFilePath);
+      const fileName = path.basename(localFilePath);
+      const ext = path.extname(localFilePath).toLowerCase();
+
+      let mimeType = 'application/octet-stream';
+      if (ext === '.pdf') mimeType = 'application/pdf';
+      else if (ext === '.jpg' || ext === '.jpeg') mimeType = 'image/jpeg';
+      else if (ext === '.png') mimeType = 'image/png';
+      else if (ext === '.webp') mimeType = 'image/webp';
+      else if (ext === '.mp4') mimeType = 'video/mp4';
+      else if (ext === '.3gp') mimeType = 'video/3gp';
+      else if (ext === '.mp3') mimeType = 'audio/mpeg';
+      else if (ext === '.ogg') mimeType = 'audio/ogg';
+      else if (ext === '.aac') mimeType = 'audio/aac';
+      else if (ext === '.m4a') mimeType = 'audio/mp4';
+      else if (ext === '.doc') mimeType = 'application/msword';
+      else if (ext === '.docx') mimeType = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
+      else if (ext === '.xls') mimeType = 'application/vnd.ms-excel';
+      else if (ext === '.xlsx') mimeType = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
+      else if (ext === '.ppt') mimeType = 'application/vnd.ms-powerpoint';
+      else if (ext === '.pptx') mimeType = 'application/vnd.openxmlformats-officedocument.presentationml.presentation';
+      else if (ext === '.txt') mimeType = 'text/plain';
+      else if (ext === '.csv') mimeType = 'text/csv';
+
+      const form = new FormData();
+      form.append('messaging_product', 'whatsapp');
+      form.append('file', fileBuffer, { filename: fileName, contentType: mimeType });
+      form.append('type', mimeType);
+
+      const uploadUrl = `https://graph.facebook.com/${version}/${phoneNumberId}/media`;
+      logger.info(`[CHATBOT] Uploading local media to Meta API: ${localFilePath} (Mime: ${mimeType}, Size: ${fileBuffer.length} bytes)`);
+
+      const response = await axios.post(uploadUrl, form, {
+        headers: {
+          ...form.getHeaders(),
+          Authorization: `Bearer ${token}`
+        },
+        timeout: 25000
+      });
+
+      const mediaId = response.data?.id;
+      if (mediaId) {
+        logger.success(`[CHATBOT] Successfully uploaded media to Meta Cloud API. MEDIA_ID: ${mediaId}`);
+        return mediaId;
+      }
+    } catch (err) {
+      logger.error(`[CHATBOT] Failed to upload media to Meta API: ${err.response?.data?.error?.message || err.message}`);
+    }
+    return null;
+  }
+
+  /**
+   * Replace {{name}}, {{phone}}, {{email}} placeholders
+   */
+  static parseVariables(text, context = {}) {
+    if (!text || typeof text !== 'string') return '';
+    return text
+      .replace(/\{\{name\}\}/gi, context.name || context.contactName || 'Customer')
+      .replace(/\{\{phone\}\}/gi, context.phone || 'N/A')
+      .replace(/\{\{email\}\}/gi, context.email || 'N/A');
+  }
+}

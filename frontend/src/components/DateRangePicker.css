@@ -1,0 +1,232 @@
+/* Date Range Picker Styles */
+.date-range-picker-wrapper {
+  position: relative;
+  display: inline-block;
+  font-family: inherit;
+}
+
+.date-range-input-wrapper {
+  position: relative;
+  display: flex;
+  align-items: center;
+  cursor: pointer;
+}
+
+.date-range-input {
+  height: 38px;
+  padding: 6px 36px 6px 12px;
+  border: 1px solid #cbd5e1;
+  border-radius: 8px;
+  background-color: #ffffff;
+  color: #1e293b;
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  width: 220px;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.05);
+  transition: border-color 0.2s, box-shadow 0.2s;
+  outline: none;
+}
+
+.date-range-input:hover,
+.date-range-input:focus {
+  border-color: #10b981;
+  box-shadow: 0 0 0 3px rgba(16, 185, 129, 0.15);
+}
+
+.date-range-icon {
+  position: absolute;
+  right: 10px;
+  pointer-events: none;
+  font-size: 15px;
+  color: #64748b;
+  display: flex;
+  align-items: center;
+}
+
+/* Calendar Popup Modal */
+.date-range-calendar {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  z-index: 9999;
+  background: #ffffff;
+  border: 1px solid #e2e8f0;
+  border-radius: 12px;
+  box-shadow: 0 12px 30px rgba(0, 0, 0, 0.15), 0 4px 6px rgba(0, 0, 0, 0.05);
+  width: 320px;
+  padding: 16px;
+  animation: fadeInDown 0.15s ease-out;
+}
+
+@keyframes fadeInDown {
+  from {
+    opacity: 0;
+    transform: translateY(-6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/* Presets Bar */
+.calendar-presets {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 6px;
+  margin-bottom: 14px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid #f1f5f9;
+}
+
+.calendar-presets button {
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+  border-radius: 6px;
+  padding: 6px 4px;
+  font-size: 11px;
+  font-weight: 600;
+  color: #475569;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  text-align: center;
+  white-space: nowrap;
+}
+
+.calendar-presets button:hover {
+  background: #ecfdf5;
+  border-color: #10b981;
+  color: #047857;
+}
+
+/* Calendar Header (Month + Year navigation) */
+.calendar-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 12px;
+}
+
+.calendar-month-year {
+  font-size: 14px;
+  font-weight: 700;
+  color: #0f172a;
+}
+
+.calendar-nav-btn {
+  background: #f1f5f9;
+  border: none;
+  border-radius: 6px;
+  width: 28px;
+  height: 28px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 16px;
+  font-weight: bold;
+  color: #334155;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+
+.calendar-nav-btn:hover {
+  background: #e2e8f0;
+  color: #0f172a;
+}
+
+/* Day Names Row */
+.calendar-day-names {
+  display: grid;
+  grid-template-columns: repeat(7, 1fr);
+  gap: 2px;
+  margin-bottom: 6px;
+  text-align: center;
+}
+
+.calendar-day-name {
+  font-size: 11px;
+  font-weight: 600;
+  color: #94a3b8;
+  padding: 4px 0;
+}
+
+/* Days Grid */
+.calendar-days {
+  display: grid;
+  grid-template-columns: repeat(7, 1fr);
+  gap: 3px;
+  margin-bottom: 12px;
+}
+
+.calendar-day {
+  aspect-ratio: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 12px;
+  font-weight: 500;
+  color: #1e293b;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: all 0.1s ease;
+  user-select: none;
+}
+
+.calendar-day:hover:not(.empty):not(.selected) {
+  background: #f1f5f9;
+  color: #0f172a;
+}
+
+.calendar-day.empty {
+  cursor: default;
+}
+
+.calendar-day.today {
+  border: 1px solid #10b981;
+  font-weight: 700;
+  color: #059669;
+}
+
+.calendar-day.in-range {
+  background: #dcfce7;
+  color: #166534;
+  border-radius: 0;
+}
+
+.calendar-day.selected {
+  background: #10b981 !important;
+  color: #ffffff !important;
+  font-weight: 700;
+  border-radius: 6px;
+}
+
+/* Footer Hint */
+.calendar-footer {
+  padding-top: 8px;
+  border-top: 1px solid #f1f5f9;
+  text-align: center;
+}
+
+.calendar-hint {
+  font-size: 11px;
+  color: #64748b;
+  font-weight: 500;
+}
+
+@media (max-width: 768px) {
+  .date-range-picker-wrapper {
+    width: 100%;
+  }
+
+  .date-range-input {
+    width: 100% !important;
+  }
+
+  .date-range-calendar {
+    width: min(320px, calc(100vw - 24px)) !important;
+    right: 0 !important;
+    left: auto !important;
+  }
+}
+

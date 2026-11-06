@@ -1,0 +1,209 @@
+import { pool } from '../config/db.js';
+import { maskToken } from '../utils/encryption.js';
+
+/**
+ * GET /api/dashboard
+ * Returns multi-tenant live statistics & connected WhatsApp accounts summary.
+ */
+export async function getDashboardStats(req, res) {
+  try {
+    const isSuperAdmin = req.user && req.user.role === 'Super Admin';
+    const reqOrgId = req.organizationId || req.user?.organization_id;
+    
+    // Non-Super Admin users are strictly restricted to their own organizationId
+    const targetOrgId = isSuperAdmin 
+      ? (req.query.organization_id ? parseInt(req.query.organization_id, 10) : (reqOrgId || 1))
+      : reqOrgId;
+    const targetUserId = req.user?.id || null;
+    const selectedAccountId = req.query.account_id || req.query.number_id || null;
+
+    if (!targetOrgId && !targetUserId) {
+      return res.json({
+        success: true,
+        data: {
+          whatsapp_account: null,
+          connected_accounts: [],
+          stats: {
+            connected: false,
+            verified_name: 'N/A',
+            business_name: 'N/A',
+            phone_number: 'N/A',
+            quality_rating: 'GREEN',
+            status: 'DISCONNECTED',
+            messages_sent: 0,
+            messages_delivered: 0,
+            messages_read: 0,
+            messages_failed: 0,
+            templates_count: 0,
+            contacts_count: 0,
+            campaigns_count: 0
+          }
+        }
+      });
+    }
+
+    const isAdmin = isSuperAdmin || req.user?.role === 'Admin' || req.user?.username === 'admin';
+
+    // 1. Fetch Connected WhatsApp Accounts
+    // Admin/SuperAdmin sees organization accounts. Team members only see accounts explicitly assigned or none if none assigned.
+    const [waAccounts] = await pool.query(
+      `SELECT id, organization_id, user_id, phone_number, phone_number_id, waba_id,
+              verified_name, display_phone_number, business_name, quality_rating,
+              verification_status, connected_at
+       FROM whatsapp_accounts WHERE organization_id = ? ORDER BY id DESC`,
+      [targetOrgId]
+    );
+
+    // 2. Fetch Messages Statistics
+    let msgStats = [{ total_sent: 0, total_delivered: 0, total_read: 0, total_failed: 0 }];
+    if (isAdmin) {
+      const [stats] = await pool.query(
+        `SELECT 
+           COUNT(*) as total_sent,
+           SUM(CASE WHEN status = 'delivered' THEN 1 ELSE 0 END) as total_delivered,
+           SUM(CASE WHEN status = 'read' THEN 1 ELSE 0 END) as total_read,
+           SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) as total_failed
+         FROM messages
+         WHERE organization_id = ? OR conversation_id IN (SELECT id FROM conversations WHERE organization_id = ?)`,
+        [targetOrgId, targetOrgId]
+      );
+      msgStats = stats;
+    } else {
+      // Member-specific messages only
+      const [stats] = await pool.query(
+        `SELECT 
+           COUNT(*) as total_sent,
+           SUM(CASE WHEN status = 'delivered' THEN 1 ELSE 0 END) as total_delivered,
+           SUM(CASE WHEN status = 'read' THEN 1 ELSE 0 END) as total_read,
+           SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) as total_failed
+         FROM messages
+         WHERE user_id = ? OR conversation_id IN (SELECT id FROM conversations WHERE user_id = ?)`,
+        [targetUserId, targetUserId]
+      );
+      msgStats = stats;
+    }
+
+    // 3. Fetch Contacts Count
+    let contactsCount = 0;
+    try {
+      if (isAdmin) {
+        const [cRows] = await pool.query(
+          `SELECT COUNT(*) as count FROM conversations WHERE organization_id = ?`,
+          [targetOrgId]
+        );
+        contactsCount = cRows[0]?.count || 0;
+      } else {
+        const [cRows] = await pool.query(
+          `SELECT COUNT(*) as count FROM conversations WHERE user_id = ?`,
+          [targetUserId]
+        );
+        contactsCount = cRows[0]?.count || 0;
+      }
+    } catch (cErr) {
+      contactsCount = 0;
+    }
+
+    // 4. Fetch Approved Templates Count (matching Official Templates table)
+    let templatesCount = 0;
+    try {
+      // 4a. Proactively clean up duplicate rows in both template tables
+      try {
+        await pool.query(`
+          DELETE wt1 FROM whatsapp_templates wt1 INNER JOIN whatsapp_templates wt2 
+          WHERE wt1.id < wt2.id AND wt1.template_name = wt2.template_name 
+          AND (wt1.organization_id = wt2.organization_id OR (wt1.organization_id IS NULL AND wt2.organization_id IS NULL))
+        `);
+      } catch (_) {}
+
+      try {
+        await pool.query(`
+          DELETE t1 FROM templates t1 INNER JOIN templates t2 
+          WHERE t1.id < t2.id AND t1.name = t2.name 
+          AND (t1.organization_id = t2.organization_id OR (t1.organization_id IS NULL AND t2.organization_id IS NULL))
+        `);
+      } catch (_) {}
+
+      // 4b. Count unique approved templates from the primary templates table
+      let orgCond = targetOrgId ? `(organization_id = ? OR (organization_id IS NULL AND user_id = ?))` : `user_id = ?`;
+      let orgParams = targetOrgId ? [targetOrgId, targetUserId] : [targetUserId];
+
+      const [tRows] = await pool.query(
+        `SELECT COUNT(DISTINCT name) as count FROM templates WHERE ${orgCond} AND status = 'APPROVED'`,
+        orgParams
+      );
+      templatesCount = tRows[0]?.count || 0;
+
+      // 4c. Fallback to whatsapp_templates if templates table has 0
+      if (templatesCount === 0) {
+        const [wtRows] = await pool.query(
+          `SELECT COUNT(DISTINCT template_name) as count FROM whatsapp_templates WHERE (organization_id = ? OR user_id = ?) AND status = 'APPROVED'`,
+          [targetOrgId || 0, targetUserId]
+        );
+        templatesCount = wtRows[0]?.count || 0;
+      }
+    } catch (tErr) {
+      console.warn('[DashboardController] Templates count query warning:', tErr.message);
+      templatesCount = 0;
+    }
+
+    // 5. Fetch Campaigns Count
+    let campaignsCount = 0;
+    try {
+      if (isAdmin) {
+        const [campRows] = await pool.query(
+          `SELECT COUNT(*) as count FROM campaigns WHERE organization_id = ?`,
+          [targetOrgId]
+        );
+        campaignsCount = campRows[0]?.count || 0;
+      } else {
+        // Sub-user campaigns only
+        const [campRows] = await pool.query(
+          `SELECT COUNT(*) as count FROM campaigns WHERE user_id = ?`,
+          [targetUserId]
+        );
+        campaignsCount = campRows[0]?.count || 0;
+      }
+    } catch (campErr) {
+      campaignsCount = 0;
+    }
+
+    // Select Active Primary WhatsApp Account
+    let primaryAccount = null;
+    if (selectedAccountId && waAccounts.length > 0) {
+      primaryAccount = waAccounts.find(acc => acc.id == selectedAccountId) || waAccounts[0];
+    } else {
+      primaryAccount = waAccounts.length > 0 ? waAccounts[0] : null;
+    }
+
+    return res.json({
+      success: true,
+      data: {
+        whatsapp_account: primaryAccount,
+        connected_accounts: waAccounts,
+        stats: {
+          connected: waAccounts.length > 0,
+          verified_name: primaryAccount ? (primaryAccount.verified_name || primaryAccount.business_name || 'Official WhatsApp Account') : 'N/A',
+          business_name: primaryAccount ? (primaryAccount.business_name || primaryAccount.verified_name || 'N/A') : 'N/A',
+          phone_number: primaryAccount ? (primaryAccount.display_phone_number || primaryAccount.phone_number) : 'N/A',
+          quality_rating: primaryAccount ? (primaryAccount.quality_rating || 'GREEN') : 'GREEN',
+          status: primaryAccount ? (primaryAccount.verification_status || 'ACTIVE') : 'DISCONNECTED',
+          messages_sent: parseInt(msgStats[0]?.total_sent || 0, 10),
+          messages_delivered: parseInt(msgStats[0]?.total_delivered || 0, 10),
+          messages_read: parseInt(msgStats[0]?.total_read || 0, 10),
+          messages_failed: parseInt(msgStats[0]?.total_failed || 0, 10),
+          templates_count: templatesCount,
+          contacts_count: contactsCount,
+          campaigns_count: campaignsCount
+        }
+      }
+    });
+
+  } catch (err) {
+    console.error('[DashboardController] Error:', err);
+    return res.status(500).json({ success: false, message: 'Failed to fetch dashboard statistics' });
+  }
+}
+
+export const getDashboard = getDashboardStats;
+
+
